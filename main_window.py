@@ -118,6 +118,7 @@ class RuleEditor(ttk.Frame):
             self.tree.heading(col, text=text)
             self.tree.column(col, width=width, anchor="w")
         self.tree.pack(fill="x")
+        self.tree.tag_configure("dim", foreground=FG_DIM)
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
 
         self.form_holder = ttk.Frame(self)
@@ -148,18 +149,33 @@ class RuleEditor(ttk.Frame):
     def _refresh_tree_item(self, rule):
         iid = rule.get("id")
         if iid and self.tree.exists(iid):
-            self.tree.item(iid, values=tree_values(rule))
+            tags = self._rule_tags(rule)
+            if tags and tags[0].startswith("c:"):
+                self.tree.tag_configure(tags[0], foreground=tags[0][2:])
+            self.tree.item(iid, values=tree_values(rule), tags=tags)
 
     # ---- 列表 ----
 
     def _rules(self):
         return self.config.rules
 
+    @staticmethod
+    def _rule_tags(rule):
+        """行标签：自定义颜色的规则整行文字用该颜色，禁用的置灰。"""
+        if not rule.get("enabled", True):
+            return ("dim",)
+        color = str(rule.get("color") or "").strip()
+        return ("c:" + color,) if color else ()
+
     def _reload_tree(self):
         selected = self.selected_id
         self.tree.delete(*self.tree.get_children())
         for rule in self._rules():
-            self.tree.insert("", "end", iid=rule.get("id", ""), values=tree_values(rule))
+            tags = self._rule_tags(rule)
+            if tags and tags[0].startswith("c:"):
+                self.tree.tag_configure(tags[0], foreground=tags[0][2:])
+            self.tree.insert("", "end", iid=rule.get("id", ""),
+                             values=tree_values(rule), tags=tags)
         if selected and selected in self.tree.get_children():
             self.tree.selection_set(selected)
         elif self.tree.get_children():

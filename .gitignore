@@ -1,0 +1,21 @@
+# ---- 用户数据与敏感信息（含 VRChat Cookie），绝不提交 ----
+config.json
+config.json.bak
+config.json.tmp
+config.json.corrupt-*
+backups/
+cache.db
+cache.db-journal
+cache/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# ---- 临时/测试产物 ----
+shot_*.png
+ui_*.png
+*.log
+*.tmp

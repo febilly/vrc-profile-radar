@@ -1,0 +1,120 @@
+"""规则定义与本地匹配（关键词 / 正则）。LLM 规则的匹配在 llm_matcher.py。"""
+import hashlib
+import json
+import re
+from dataclasses import dataclass, field
+
+KEYWORD = "keyword"
+REGEX = "regex"
+LLM = "llm"
+
+ALL_FIELDS = ("bio", "bioLinks", "displayName", "pronouns", "statusDescription", "tags")
+
+
+@dataclass
+class Rule:
+    id: str = ""
+    name: str = ""
+    type: str = KEYWORD
+    keywords: list = field(default_factory=list)
+    mode: str = "any"          # any=命中任一关键词 / all=全部命中
+    pattern: str = ""
+    fields: list = field(default_factory=lambda: ["bio"])
+    prompt: str = ""           # 仅 llm 类型
+    enabled: bool = True
+
+    @classmethod
+    def from_dict(cls, data):
+        rule = cls(
+            id=str(data.get("id") or ""),
+            name=str(data.get("name") or "未命名规则"),
+            type=str(data.get("type") or KEYWORD).lower(),
+            keywords=[str(k) for k in (data.get("keywords") or [])],
+            mode="all" if data.get("mode") == "all" else "any",
+            pattern=str(data.get("pattern") or ""),
+            fields=[str(f) for f in (data.get("fields") or ["bio"]) if str(f) in ALL_FIELDS],
+            prompt=str(data.get("prompt") or ""),
+            enabled=bool(data.get("enabled", True)),
+        )
+        if not rule.id:
+            rule.id = "rule-" + hashlib.md5(
+                json.dumps(data, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            ).hexdigest()[:8]
+        if not rule.fields:
+            rule.fields = ["bio"]
+        return rule
+
+    def to_dict(self):
+        return {
+            "id": self.id, "name": self.name, "type": self.type,
+            "keywords": self.keywords, "mode": self.mode, "pattern": self.pattern,
+            "fields": self.fields, "prompt": self.prompt, "enabled": self.enabled,
+        }
+
+
+def rule_hash(rule):
+    """规则内容指纹（参与 LLM 缓存 key：改了规则文本就自动失效重算）。"""
+    if rule.type == LLM:
+        payload = {"type": LLM, "prompt": rule.prompt}
+    elif rule.type == KEYWORD:
+        payload = {"type": KEYWORD, "keywords": sorted(rule.keywords), "mode": rule.mode,
+                   "fields": sorted(rule.fields)}
+    else:
+        payload = {"type": REGEX, "pattern": rule.pattern, "fields": sorted(rule.fields)}
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:16]
+
+
+def fields_text(profile, fields):
+    """取出要匹配的文本片段列表。"""
+    texts = []
+    for name in fields:
+        value = profile.get(name)
+        if name == "bioLinks":
+            texts.extend(str(v) for v in (value or []))
+        elif isinstance(value, list):
+            texts.extend(str(v) for v in value)
+        elif value:
+            texts.append(str(value))
+    return texts
+
+
+def match_keyword(rule, profile):
+    """返回命中的关键词列表（保留关键词原样大小写用于展示）；不符合则空列表。
+
+    匹配用 casefold()，保证不区分大小写（比 lower() 覆盖更全的 Unicode 大小写折叠）。
+    """
+    texts = [t.casefold() for t in fields_text(profile, rule.fields)]
+    kws = [(k.strip(), k.strip().casefold()) for k in rule.keywords if k.strip()]
+    if not kws:
+        return []
+    if rule.mode == "all":
+        hits = [orig for orig, folded in kws if any(folded in t for t in texts)]
+        return hits if len(hits) == len(kws) else []
+    return [orig for orig, folded in kws if any(folded in t for t in texts)]
+
+
+def match_regex(rule, profile):
+    """返回命中的文本片段列表（去重）；不符合则空列表。"""
+    if not rule.pattern:
+        return []
+    try:
+        compiled = re.compile(rule.pattern, re.IGNORECASE)
+    except re.error:
+        return []
+    hits = []
+    for text in fields_text(profile, rule.fields):
+        m = compiled.search(text)
+        if m and m.group(0) not in hits:
+            hits.append(m.group(0))
+    return hits
+
+
+def match_local(rule, profile):
+    """本地规则统一入口，返回命中描述列表。"""
+    if rule.type == KEYWORD:
+        return match_keyword(rule, profile)
+    if rule.type == REGEX:
+        return match_regex(rule, profile)
+    return []

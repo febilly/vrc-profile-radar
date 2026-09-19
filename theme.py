@@ -1,0 +1,157 @@
+"""深色主题：颜色常量 + ttk 样式（基于 clam 主题，Windows 上可完全自定义配色）+ 高DPI适配。"""
+import ctypes
+import hashlib
+import tkinter as tk
+from tkinter import ttk
+
+SCALE = 1.0   # 像素尺寸缩放系数（系统 DPI / 96），init_scaling() 后生效
+
+
+def enable_high_dpi():
+    """声明进程 DPI 感知，避免 Windows 把 96DPI 渲染的窗口位图拉伸导致模糊。
+
+    必须在创建任何窗口（tk.Tk()）之前调用。
+    """
+    if not hasattr(ctypes, "windll"):
+        return
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PER_MONITOR_DPI_AWARE
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
+
+def init_scaling(root):
+    """创建 Tk root 后调用：计算像素缩放系数并应用到 ttk 像素尺寸。"""
+    global SCALE
+    try:
+        SCALE = max(1.0, root.winfo_fpixels("1i") / 96.0)
+    except Exception:
+        SCALE = 1.0
+    return SCALE
+
+
+def px(n):
+    """把按 96DPI 设计的像素尺寸换算成当前 DPI 的实际像素。"""
+    return int(n * SCALE)
+
+
+BG        = "#1e1f22"   # 主背景
+BG_ALT    = "#26282b"   # 列表/次级背景
+BG_CARD   = "#2b2d31"   # 卡片/按钮
+BG_INPUT  = "#131417"   # 输入框
+BG_HOVER  = "#33363b"
+BORDER    = "#3a3d42"
+FG        = "#e6e7ea"
+FG_DIM    = "#9aa0a8"
+ACCENT    = "#5aa2ff"
+OK        = "#3ba55d"
+WARN      = "#faa61a"
+ERR       = "#ed4245"
+LINK      = "#6cb2ff"
+
+CHIP_COLORS = ["#7bd88f", "#69c0ff", "#f5b971", "#e397de", "#66d9e5", "#ffd76e", "#b3a3ff"]
+CHIP_BG = "#33363b"
+
+FONT = "Microsoft YaHei UI"
+
+
+def chip_color(name):
+    return CHIP_COLORS[int(hashlib.md5(name.encode("utf-8")).hexdigest(), 16) % len(CHIP_COLORS)]
+
+
+def add_tooltip(widget, text):
+    """悬停提示（不占布局空间）。"""
+    if not text:
+        return
+    tip = {"win": None}
+
+    def enter(_):
+        if tip["win"]:
+            return
+        x = widget.winfo_rootx() + 10
+        y = widget.winfo_rooty() + widget.winfo_height() + 2
+        tw = tk.Toplevel(widget)
+        tw.wm_overrideredirect(True)
+        tw.wm_geometry("+%d+%d" % (x, y))
+        tk.Label(tw, text=text, background="#0f1011", foreground="#e6e7ea",
+                 relief="flat", font=(FONT, 8), justify="left", padx=6, pady=3).pack()
+        tip["win"] = tw
+
+    def leave(_):
+        if tip["win"]:
+            tip["win"].destroy()
+            tip["win"] = None
+
+    widget.bind("<Enter>", enter, add="+")
+    widget.bind("<Leave>", leave, add="+")
+
+
+def apply_dark_style(root):
+    style = ttk.Style(root)
+    try:
+        style.theme_use("clam")
+    except tk.TclError:
+        pass
+
+    style.configure(".", background=BG, foreground=FG, bordercolor=BORDER,
+                    lightcolor=BG, darkcolor=BG, troughcolor=BG_ALT,
+                    focuscolor=BG, selectbackground="#3b5a7a", selectforeground=FG,
+                    font=(FONT, 9))
+    style.configure("TFrame", background=BG)
+    style.configure("TLabel", background=BG, foreground=FG)
+    style.configure("Dim.TLabel", background=BG, foreground=FG_DIM)
+    style.configure("Head.TLabel", background=BG, foreground=FG, font=(FONT, 10, "bold"))
+
+    style.configure("TButton", background=BG_CARD, foreground=FG, borderwidth=0,
+                    padding=(px(10), px(4)), relief="flat")
+    style.map("TButton", background=[("active", BG_HOVER), ("disabled", BG_ALT)],
+              foreground=[("disabled", FG_DIM)])
+    style.configure("Tool.TButton", background=BG_CARD, foreground=FG, borderwidth=0,
+                    padding=(px(7), px(3)), relief="flat", font=(FONT, 9))
+    style.map("Tool.TButton", background=[("active", BG_HOVER), ("disabled", BG_ALT)],
+              foreground=[("disabled", FG_DIM)])
+    style.configure("Accent.TButton", background="#2d5a9e", foreground="#ffffff")
+    style.map("Accent.TButton", background=[("active", "#3a6cbb"), ("disabled", BG_CARD)])
+
+    style.configure("TEntry", fieldbackground=BG_INPUT, foreground=FG,
+                    insertcolor=FG, bordercolor=BORDER, lightcolor=BORDER, darkcolor=BORDER,
+                    padding=px(3))
+    style.map("TEntry", bordercolor=[("focus", ACCENT)], lightcolor=[("focus", ACCENT)])
+    style.configure("TText", background=BG_INPUT, foreground=FG)
+
+    style.configure("TCheckbutton", background=BG, foreground=FG, focuscolor=BG)
+    style.map("TCheckbutton", background=[("active", BG)])
+    style.configure("TRadiobutton", background=BG, foreground=FG, focuscolor=BG)
+    style.map("TRadiobutton", background=[("active", BG)])
+
+    style.configure("Treeview", background=BG_ALT, fieldbackground=BG_ALT,
+                    foreground=FG, borderwidth=0, rowheight=px(26))
+    style.configure("Treeview.Heading", background=BG_CARD, foreground=FG_DIM,
+                    borderwidth=0, padding=(px(4), px(3)))
+    style.map("Treeview", background=[("selected", "#34435c")],
+              fieldbackground=[("disabled", BG_ALT)])
+
+    style.configure("TNotebook", background=BG, borderwidth=0, tabmargins=(px(6), px(6), px(6), 0))
+    # 未选中标签：与页面同色的扁平暗灰；选中标签：更亮、更大、无描边 —— 明确区分
+    style.configure("TNotebook.Tab", background=BG, foreground=FG_DIM,
+                    padding=(px(12), px(5)), borderwidth=0,
+                    lightcolor=BG, darkcolor=BG, bordercolor=BG)
+    style.map("TNotebook.Tab",
+              background=[("selected", BG_HOVER)],
+              foreground=[("selected", FG)],
+              lightcolor=[("selected", BG_HOVER)],
+              darkcolor=[("selected", BG_HOVER)],
+              bordercolor=[("selected", BG_HOVER)],
+              padding=[("selected", (px(16), px(7)))],
+              expand=[("selected", (px(1), px(1), px(1), 0))])
+
+    style.configure("TLabelframe", background=BG, borderwidth=0)
+    style.configure("TLabelframe.Label", background=BG, foreground=FG_DIM)
+    style.configure("TSeparator", background=BORDER)
+    style.configure("Horizontal.TScale", background=BG, troughcolor=BG_ALT,
+                    bordercolor=BORDER, lightcolor=ACCENT, darkcolor=ACCENT)
+    style.configure("TScrollbar", background=BG_CARD, troughcolor=BG,
+                    bordercolor=BG, arrowcolor=FG_DIM, relief="flat")

@@ -1,0 +1,349 @@
+"""自检测试：python main.py --check
+覆盖 日志解析 / 规则匹配 / 缓存 / LLM输出解析 / 完整扫描流水线（假数据），不联网。
+"""
+import os
+import shutil
+import tempfile
+import threading
+import time
+
+import config as config_mod
+import rules as rules_mod
+from rules import Rule
+from vrchat_log import parse_line
+import vrchat_log
+from cache_store import CacheStore
+from llm_matcher import extract_json
+from matcher import Matcher
+
+PASS = 0
+FAIL = 0
+
+
+def check(name, cond, detail=""):
+    global PASS, FAIL
+    if cond:
+        PASS += 1
+        print("  [通过] %s" % name)
+    else:
+        FAIL += 1
+        print("  [失败] %s %s" % (name, detail))
+
+
+def test_log_parsing():
+    print("== 日志解析 ==")
+    join_with_id = ("2024.01.01 12:34:56 Log        -  [Behaviour] OnPlayerJoined "
+                    "TestUser (usr_00000000-0000-0000-0000-000000000000)")
+    ev = parse_line(join_with_id)
+    check("OnPlayerJoined 带usr id", ev == {"kind": "join", "name": "TestUser",
+          "user_id": "usr_00000000-0000-0000-0000-000000000000", "time": "2024.01.01 12:34:56"}, repr(ev))
+
+    ev = parse_line("2024.01.01 12:34:56 Log        -  [NetworkManager] OnPlayerJoined Rize♡")
+    check("OnPlayerJoined 无id/unicode名", ev and ev["kind"] == "join" and ev["name"] == "Rize♡"
+          and ev["user_id"] == "", repr(ev))
+
+    ev = parse_line("2024.01.01 12:34:56 Log        -  [Behaviour] OnPlayerLeft Rize♡ (usr_aaaa-bbbb)")
+    check("OnPlayerLeft", ev and ev["kind"] == "leave" and ev["user_id"] == "usr_aaaa-bbbb", repr(ev))
+
+    check("OnPlayerLeftRoom 应忽略",
+          parse_line("2024.01.01 12:34:56 Log        -  [Behaviour] OnPlayerLeftRoom") is None)
+    check("OnPlayerJoined:Unnamed 应忽略",
+          parse_line("2024.01.01 12:34:56 Log        -  [Behaviour] OnPlayerJoined:Unnamed") is None)
+
+    ev = parse_line("2024.01.01 12:34:56 Log        -  [Behaviour] Joining "
+                    "wrld_4432ea9b-729c-46e3-8eaf-846aa0a37fdd:67646~region(jp)~nonce(ABC)")
+    check("Joining 新格式", ev and ev["kind"] == "world"
+          and ev["world_id"] == "wrld_4432ea9b-729c-46e3-8eaf-846aa0a37fdd", repr(ev))
+
+    check("Joining or Creating Room 应忽略",
+          parse_line("2024.01.01 12:34:56 Log        -  [RoomManager] Joining or Creating Room: VRChat Home") is None)
+
+    ev = parse_line("2024.01.01 12:34:56 Log        -  [Behaviour] Entering Room: VRChat Home")
+    check("Entering Room 世界名", ev and ev["kind"] == "world_name" and ev["name"] == "VRChat Home", repr(ev))
+
+    ev = parse_line('2024.01.01 12:34:56 Log        -  [Player] Initialized PlayerAPI "TestUser" is local')
+    check("本地玩家识别", ev and ev["kind"] == "local" and ev["name"] == "TestUser", repr(ev))
+
+    ev = parse_line("2024.01.01 12:34:56 Log        -  [API] User Authenticated: foo (usr_abc123)")
+    check("User Authenticated", ev and ev["kind"] == "local" and ev["user_id"] == "usr_abc123", repr(ev))
+
+    check("普通日志应忽略",
+          parse_line("2024.01.01 12:34:56 Log        -  [SaveSystem] Save data") is None)
+
+
+def test_rules():
+    print("== 规则匹配 ==")
+    profile = {"bio": "I love VRChat! 日语勉強中", "bioLinks": ["https://x.com/foo"],
+               "displayName": "Test", "tags": ["system_trust_veteran"]}
+    rule = Rule.from_dict({"name": "r1", "type": "keyword", "keywords": ["日语", "english"], "mode": "any"})
+    check("关键词 any 命中", rules_mod.match_keyword(rule, profile) == ["日语"])
+    rule_all = Rule.from_dict({"name": "r2", "type": "keyword", "keywords": ["日语", "english"], "mode": "all"})
+    check("关键词 all 未全中", rules_mod.match_keyword(rule_all, profile) == [])
+    rule_links = Rule.from_dict({"name": "r3", "type": "regex",
+                                 "pattern": r"(?:twitter|x)\.com/[A-Za-z0-9_]+", "fields": ["bio", "bioLinks"]})
+    check("正则匹配链接", rules_mod.match_regex(rule_links, profile) == ["x.com/foo"])
+    rule_tags = Rule.from_dict({"name": "r4", "type": "keyword", "keywords": ["veteran"], "fields": ["tags"]})
+    check("关键词匹配tags", rules_mod.match_keyword(rule_tags, profile) == ["veteran"])
+    h1, h2 = rules_mod.rule_hash(rule), rules_mod.rule_hash(rule)
+    check("规则哈希稳定", h1 == h2)
+    h3 = rules_mod.rule_hash(Rule.from_dict({"name": "r1", "type": "keyword", "keywords": ["别的"]}))
+    check("规则内容不同哈希不同", h1 != h3)
+
+    # 大小写不敏感
+    profile_ci = {"bio": "I love VRChat! Japanese learner and straße fan", "bioLinks": []}
+    rule_ci = Rule.from_dict({"name": "ci", "type": "keyword",
+                              "keywords": ["JAPANESE", "VrChAt", "STRASSE", "没有的词"]})
+    hits = rules_mod.match_keyword(rule_ci, profile_ci)
+    check("关键词不区分大小写", hits == ["JAPANESE", "VrChAt", "STRASSE"], repr(hits))
+    check("命中回显保留原样大小写", hits and hits[0] == "JAPANESE")
+    rule_ci_all = Rule.from_dict({"name": "ci2", "type": "keyword",
+                                  "keywords": ["jApAnEsE", "vRcHaT"], "mode": "all"})
+    check("all模式不区分大小写", rules_mod.match_keyword(rule_ci_all, profile_ci) == ["jApAnEsE", "vRcHaT"])
+    rule_case_dup = Rule.from_dict({"name": "dup", "type": "keyword", "keywords": ["  VRChat "]})
+    check("关键词带空格也可命中", rules_mod.match_keyword(rule_case_dup, profile_ci) == ["VRChat"])
+
+
+def test_cache():
+    print("== 缓存 ==")
+    tmpdir = tempfile.mkdtemp()
+    try:
+        store = CacheStore(os.path.join(tmpdir, "t.db"))
+        store.put_profile("usr_x", {"displayName": "X", "bio": "hello"})
+        profile, fetched_at = store.get_profile("usr_x")
+        check("简介缓存读写", profile == {"displayName": "X", "bio": "hello"} and fetched_at > 0)
+        store.put_llm("k1", {"match": True, "reason": "r"})
+        check("LLM缓存读写", store.get_llm("k1") == {"match": True, "reason": "r"})
+        check("LLM缓存未命中", store.get_llm("k2") is None)
+        store.put_llm("k1", {"match": False, "reason": "r2"})
+        check("LLM缓存覆盖", store.get_llm("k1")["match"] is False)
+        store.clear_llm()
+        check("LLM缓存清空", store.get_llm("k1") is None)
+
+        # 简介缓存：按获取时间绝对过期（读取不续期），写入时清理过期条目
+        import time as _time
+        store = CacheStore(os.path.join(tmpdir, "t2.db"))
+        store.put_profile("usr_a", {"displayName": "A"}, max_age_seconds=3600)
+        _, ts1 = store.get_profile("usr_a")
+        _, ts2 = store.get_profile("usr_a")
+        check("简介缓存读取不续期", ts1 == ts2)
+        store._conn.execute(
+            "UPDATE profiles SET fetched_at = ? WHERE user_id = 'usr_a'",
+            (_time.time() - 7200,),
+        )
+        store._conn.commit()
+        store.put_profile("usr_b", {"displayName": "B"}, max_age_seconds=3600)
+        check("过期简介被清理", store.get_profile("usr_a")[0] is None)
+        check("未过期的简介保留", store.get_profile("usr_b")[0] is not None)
+
+        # LLM 结果缓存：按数量上限 LRU（命中即续期）
+        store.put_llm("k1", {"match": True}, max_count=3)
+        _time.sleep(0.02)
+        store.put_llm("k2", {"match": True}, max_count=3)
+        _time.sleep(0.02)
+        store.put_llm("k3", {"match": True}, max_count=3)
+        _time.sleep(0.02)
+        store.get_llm("k1")  # 命中 k1 → 续期
+        _time.sleep(0.02)
+        store.put_llm("k4", {"match": True}, max_count=3)
+        check("LLM缓存超限淘汰最久未用", store.get_llm("k2") is None)
+        check("LLM缓存命中过的保留", store.get_llm("k1") is not None)
+        check("LLM缓存其余保留", store.get_llm("k3") is not None and store.get_llm("k4") is not None)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_extract_json():
+    print("== LLM 输出解析 ==")
+    text = '好的，以下是结果：\n```json\n{"results": [{"id": "u1", "match": true, "reason": "x"}]}\n```'
+    obj = extract_json(text)
+    check("围栏JSON解析", obj and obj["results"][0]["id"] == "u1", repr(obj))
+    obj = extract_json('垃圾输出 {"results": []} 结束')
+    check("夹带JSON解析", obj == {"results": []}, repr(obj))
+    check("无JSON返回None", extract_json("完全不是json") is None)
+
+
+def test_pipeline():
+    print("== 完整流水线（假数据） ==")
+    tmpdir = tempfile.mkdtemp()
+    try:
+        cfg_path = os.path.join(tmpdir, "config.json")
+        cfg = config_mod.Config(cfg_path)
+        cfg.set([
+            {"id": "kw", "name": "日语学习者", "type": "keyword", "keywords": ["日语", "日本語"], "mode": "any"},
+            {"id": "re", "name": "X链接", "type": "regex", "pattern": r"(?:twitter|x)\.com/\w+",
+             "fields": ["bio", "bioLinks"]},
+            {"id": "llm1", "name": "创作者", "type": "llm", "prompt": "判断是否创作者"},
+        ], "rules")
+        cfg.set("", "cookies", "auth")
+
+        from cache_store import CacheStore
+        import demo
+        cache = CacheStore(os.path.join(tmpdir, "cache.db"))
+        matcher = Matcher(cfg, cache, api=None)
+        demo.setup(matcher, cfg)
+        events = []
+        matcher.sinks.append(events.append)
+        matcher.start()
+
+        deadline = time.time() + 25
+        while time.time() < deadline:
+            with matcher._lock:
+                matches = {m["user_id"]: m for m in matcher._matches.values()}
+            names = {m["name"] for m in matches.values()}
+            if {"星野くるみ", "Jack_Miller", "Alice", "Bob_Builder", "Diana"} <= names:
+                break
+            time.sleep(0.2)
+
+        check("关键词规则命中(日语学习者)", {"星野くるみ", "Jack_Miller"} <= names, str(names))
+        check("正则规则命中(X链接)", "Alice" in names, str(names))
+        check("LLM规则命中(创作者)", {"Bob_Builder", "Diana"} <= names, str(names))
+        check("不匹配的人未出现", "Charlie" not in names and "Eve" not in names, str(names))
+        check("本地玩家未参与匹配", len(names) == 5, str(names))
+
+        rule_names = {r["name"] for r in matches[
+            "usr_dddddddd-1111-2222-3333-444444444444"]["rules"]}
+        check("同人可命中多条规则", rule_names == {"创作者"}, str(rule_names))
+
+        # 状态表：实例内所有人都在列（含零命中的）
+        roster = matcher.get_roster()
+        roster_names = [e["name"] for e in roster]
+        check("状态表包含全部玩家", len(roster) == 7, str(roster_names))
+        check("零命中的玩家也在状态表", any(
+            e["name"] == "Charlie" and not e["rules"] for e in roster), str(roster))
+        check("命中的玩家带规则", any(
+            e["name"] == "Alice" and e["rules"] for e in roster), str(roster))
+        check("已检测状态标注", any(e["status"] == "已检测" for e in roster),
+              str([e["status"] for e in roster]))
+        check("状态表带简介且无换行", any(
+            e["name"] == "Bob_Builder" and "Blender" in e["bio"] and chr(10) not in e["bio"]
+            for e in roster), str([e.get("bio", "")[:20] for e in roster]))
+
+        # 离开事件应把 Eve 相关内容清掉（Eve 本来就没匹配），换 Jack 离开验证
+        with matcher._lock:
+            before = len(matcher._players)
+        matcher.handle_log_event({"kind": "leave", "name": "Jack_Miller",
+                                  "user_id": "usr_bbbbbbbb-1111-2222-3333-444444444444"})
+        time.sleep(0.5)
+        with matcher._lock:
+            after = len(matcher._players)
+        check("离开事件减少玩家数", after == before - 1, "%d->%d" % (before, after))
+
+        # 缓存验证：第二次扫描不应再调用 FakeAPI（记录调用次数）
+        calls = {"n": 0}
+        real_get = matcher.api.get_profile
+
+        def counting_get(uid):
+            calls["n"] += 1
+            return real_get(uid)
+
+        matcher.api.get_profile = counting_get
+        matcher.handle_log_event({"kind": "join", "name": "Charlie",
+                                  "user_id": "usr_eeeeeeee-1111-2222-3333-444444444444"})
+        time.sleep(4)
+        check("缓存生效：老玩家未重新请求API", calls["n"] <= 1, str(calls["n"]))
+
+        # LLM 结果缓存：同简介重复扫描不再调用大模型
+        calls_llm = {"n": 0}
+        orig_chunk = matcher.llm._match_chunk_with_fallback
+
+        def counting_chunk(rule, chunk):
+            calls_llm["n"] += 1
+            return orig_chunk(rule, chunk)
+
+        matcher.llm._match_chunk_with_fallback = counting_chunk
+        matcher.handle_log_event({"kind": "join", "name": "Diana",
+                                  "user_id": "usr_ffffffff-1111-2222-3333-444444444444"})
+        time.sleep(4)
+        check("LLM结果已落库：重扫不再调用大模型", calls_llm["n"] == 0, str(calls_llm["n"]))
+
+        matched_events = [e for e in events if e.get("type") == "matches"]
+        status_events = [e for e in events if e.get("type") == "status"]
+        check("输出了matches事件", len(matched_events) >= 3, str(len(matched_events)))
+        check("输出了status事件", len(status_events) >= 3, str(len(status_events)))
+        matcher.stop()
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_config_backup():
+    print("== 配置备份与恢复 ==")
+    tmpdir = tempfile.mkdtemp()
+    try:
+        p = os.path.join(tmpdir, "config.json")
+        my_rules = [{"id": "mine", "name": "我的规则", "type": "keyword", "keywords": ["测试词"]}]
+        cfg = config_mod.Config(p)
+        cfg.set(my_rules, "rules")
+
+        # 场景1：config.json 被误删 -> 重启自动恢复规则
+        os.remove(p)
+        cfg2 = config_mod.Config(p)
+        got = cfg2.get("rules")
+        check("config 被删后自动恢复规则", got and got[0]["name"] == "我的规则", repr(got))
+
+        # 场景2：config.json 损坏 -> 自动恢复
+        cfg2.set([{"id": "mine2", "name": "第二版规则", "type": "keyword", "keywords": ["y"]}], "rules")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("{这不是JSON")
+        cfg3 = config_mod.Config(p)
+        got = cfg3.get("rules")
+        check("config 损坏后自动恢复规则", got and got[0]["name"] == "第二版规则", repr(got))
+        check("损坏文件被留档", any("corrupt" in n for n in os.listdir(tmpdir)))
+
+        # 场景3：全新目录（无备份）-> 生成默认配置
+        p2 = os.path.join(tmpdir, "fresh", "config.json")
+        cfg4 = config_mod.Config(p2)
+        check("无备份时生成默认配置", isinstance(cfg4.get("rules"), list) and cfg4.get("rules"))
+
+        # 场景4：每日快照保留 7 天
+        cfg4.set("x", "ui", "alpha")
+        snaps = [n for n in os.listdir(cfg4.backup_dir) if n.startswith("config-2")]
+        check("每日快照存在", len(snaps) == 1, repr(snaps))
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_log_discovery():
+    print("== 日志文件发现（新旧位置兼容） ==")
+    tmpdir = tempfile.mkdtemp()
+    try:
+        # 新版：根目录；旧版：Output Log 子目录。最新文件在旧版子目录里也要能找到
+        new_dir = os.path.join(tmpdir, "VRChat")
+        old_dir = os.path.join(new_dir, "Output Log")
+        os.makedirs(new_dir)
+        os.makedirs(old_dir)
+        f1 = os.path.join(new_dir, "output_log_2026-09-19_00-44-18.txt")
+        f2 = os.path.join(old_dir, "output_log_2026-09-20_04-59-49.txt")
+        for path in (f1, f2):
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("")
+        # 反转创建时间，验证按文件名时间戳而不是 ctime 排序
+        os.utime(f1, (time.time() + 100, time.time() + 100))
+        found = vrchat_log.latest_log_file(log_dir=new_dir)
+        check("跨新旧目录找到最新日志", found == f2, repr(found))
+        # 只有根目录文件时
+        os.remove(f2)
+        found = vrchat_log.latest_log_file(log_dir=new_dir)
+        check("根目录文件被发现", found == f1, repr(found))
+        # 目录不存在时返回 None
+        check("目录不存在返回 None",
+              vrchat_log.latest_log_file(log_dir=os.path.join(tmpdir, "nope")) is None)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def run():
+    print("开始自检（不联网、不依赖 VRChat）\n")
+    test_log_parsing()
+    test_log_discovery()
+    test_rules()
+    test_cache()
+    test_extract_json()
+    test_config_backup()
+    test_pipeline()
+    print("\n结果: %d 通过, %d 失败" % (PASS, FAIL))
+    return FAIL == 0
+
+
+if __name__ == "__main__":
+    import sys
+    sys.exit(0 if run() else 1)

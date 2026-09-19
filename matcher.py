@@ -1,0 +1,441 @@
+"""扫描流水线：日志事件 -> 限流拉取资料 -> 本地规则 + LLM 规则 -> 输出匹配结果。
+
+线程模型：
+  LogTailer 线程 -> handle_log_event()（只更新玩家表、安排扫描）
+  扫描工作线程 -> run_scan()（拉资料、跑规则、emit 结果）
+  头像线程池   -> 下载匹配用户的头像缩略图
+结果通过 emit(event dict) 发给各 sink（UI 队列 / 控制台）。
+"""
+import hashlib
+import os
+import re
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+import requests
+
+import rules as rules_mod
+from rules import Rule, KEYWORD, REGEX, LLM
+from llm_matcher import LLMMatcher, LLMNotConfigured
+from vrchat_api import VRChatAPIError
+
+PROFILE_FIELDS = (
+    "displayName", "bio", "bioLinks", "pronouns", "tags", "trustTags",
+    "status", "statusDescription", "date_joined", "last_platform",
+    "iconUrl", "profilePicOverride", "userIcon",
+    "currentAvatarThumbnailImageUrl", "currentAvatarImageUrl",
+)
+_AVATAR_FALLBACK = (
+    "iconUrl", "profilePicOverride", "userIcon",
+    "currentAvatarThumbnailImageUrl", "currentAvatarImageUrl",
+)
+
+
+def slim_profile(full):
+    """从 API 原始响应提取匹配与展示所需的字段。
+
+    头像按 fallback 链取（/profile 与 /users 现在只返回 iconUrl，旧字段保留兜底）；
+    tags 缺失时用 trustTags（/profile 返回的信任等级）代替。
+    """
+    profile = {
+        "displayName": full.get("displayName", ""),
+        "bio": full.get("bio", ""),
+        "bioLinks": full.get("bioLinks") or [],
+        "avatar": "",
+        "pronouns": full.get("pronouns", ""),
+        "status": full.get("status", ""),
+        "statusDescription": full.get("statusDescription", ""),
+        "date_joined": full.get("date_joined", ""),
+    }
+    tags = full.get("tags") or full.get("trustTags")
+    if tags:
+        profile["tags"] = tags
+    for key in _AVATAR_FALLBACK:
+        if full.get(key):
+            profile["avatar"] = full[key]
+            break
+    return profile
+
+
+class Matcher:
+    def __init__(self, config, cache, api=None, log_dir=""):
+        self.config = config
+        self.cache = cache
+        self.api = api
+        self.llm = LLMMatcher(config, cache)
+        self.sinks = []
+        self.debounce = float(config.get("scan", "debounce_seconds", default=3.0) or 3.0)
+        self.profile_cache_hours = float(config.get("api", "profile_cache_hours", default=4) or 4)
+
+        self._players = {}          # key -> {"name", "user_id"}
+        self._profiles = {}         # user_id -> slim profile
+        self._matches = {}          # user_id -> {"user_id","name","rules":[...]}
+        self._failed_uids = set()   # 最近一次扫描里获取失败的玩家
+        self._scanning = False
+        self._fetching_uid = None
+        self.last_scan_time = 0.0
+        self._local_uid = ""
+        self._local_name = ""
+        self.location = ""
+        self.world_name = ""
+        self._cookie_error = False
+        self._llm_warned = False
+
+        self._lock = threading.RLock()
+        self._stop = threading.Event()
+        self._wakeup = threading.Event()
+        self._timer = None
+        self._scan_thread = None
+        self._avatar_pool = None
+        self.avatar_dir = os.path.join(os.path.dirname(os.path.abspath(config.path)), "cache", "avatars")
+
+    # ---- sink ----
+
+    def emit(self, event):
+        for sink in list(self.sinks):
+            try:
+                sink(event)
+            except Exception:
+                pass
+
+    def _status(self, text, level="info"):
+        with self._lock:
+            self.emit({
+                "type": "status", "text": text, "level": level,
+                "players": len(self._players),
+                "instance": self.world_name or self.location,
+            })
+
+    def _emit_matches(self):
+        with self._lock:
+            self.emit({
+                "type": "matches",
+                "matches": [dict(m, rules=list(m["rules"])) for m in self._matches.values()],
+                "players": len(self._players),
+            })
+
+    # ---- 生命周期 ----
+
+    def start(self):
+        self._scan_thread = threading.Thread(target=self._scan_loop, daemon=True, name="Scanner")
+        self._scan_thread.start()
+        self._avatar_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="Avatar")
+        self._status("监控中，等待进入实例…")
+
+    def stop(self):
+        self._stop.set()
+        self._wakeup.set()
+
+    def reload_settings(self):
+        self.debounce = float(self.config.get("scan", "debounce_seconds", default=3.0) or 3.0)
+        self.profile_cache_hours = float(self.config.get("api", "profile_cache_hours", default=4) or 4)
+
+    # ---- 日志事件入口 ----
+
+    def handle_log_event(self, ev):
+        kind = ev.get("kind")
+        if kind == "world":
+            with self._lock:
+                self.location = ev.get("location", "")
+                if ev.get("world_id"):
+                    self.location = self.location or ev["world_id"]
+                self._players.clear()
+                self._matches.clear()
+                self._profiles.clear()
+                self.world_name = ""
+            self._status("进入新实例，正在收集玩家…")
+            self._emit_matches()
+            self._schedule_scan()
+        elif kind == "world_name":
+            with self._lock:
+                self.world_name = ev.get("name", "")
+            self._status(None)  # 刷新实例名显示
+        elif kind == "join":
+            key = ev.get("user_id") or ("name:" + ev.get("name", ""))
+            with self._lock:
+                self._players[key] = {"name": ev.get("name", ""), "user_id": ev.get("user_id", "")}
+            self._schedule_scan()
+        elif kind == "leave":
+            key = ev.get("user_id") or ("name:" + ev.get("name", ""))
+            with self._lock:
+                self._players.pop(key, None)
+                uid = ev.get("user_id")
+                if uid and uid in self._matches:
+                    del self._matches[uid]
+            self._emit_matches()
+            self._status(None)
+        elif kind == "local":
+            with self._lock:
+                if ev.get("user_id"):
+                    self._local_uid = ev["user_id"]
+                if ev.get("name"):
+                    self._local_name = ev["name"]
+                # 日志里只有名字没有id时，把自己从匹配里去掉（按名字）
+                self._matches.pop(self._local_uid, None)
+                self._matches.pop("name:" + self._local_name, None)
+
+    def _schedule_scan(self):
+        with self._lock:
+            if self._timer:
+                self._timer.cancel()
+            self._timer = threading.Timer(self.debounce, self._wakeup.set)
+            self._timer.daemon = True
+            self._timer.start()
+
+    # ---- 扫描 ----
+
+    def _scan_loop(self):
+        while not self._stop.is_set():
+            self._wakeup.wait()
+            self._wakeup.clear()
+            if self._stop.is_set():
+                return
+            try:
+                self.run_scan()
+            except Exception as exc:
+                self._status("扫描出错: %s" % exc, level="error")
+
+    def run_scan(self):
+        with self._lock:
+            snapshot = list(self._players.values())
+        if not snapshot:
+            return
+
+        if self.api is None or not self.api.configured:
+            self._cookie_error = True
+            self._status("未配置 VRChat Cookie，无法获取资料（设置里填 auth cookie）", level="warn")
+            return
+
+        self._cookie_error = False
+        self._status("正在拉取 %d 位玩家资料…" % len(snapshot))
+        self._scanning = True
+        try:
+            fetched, failed = 0, 0
+            with self._lock:
+                self._failed_uids = set()
+            for i, player in enumerate(snapshot):
+                if self._stop.is_set():
+                    return
+                uid = player["user_id"]
+                if not uid:
+                    continue  # 旧版日志无 usr id，无法查询
+                if uid == self._local_uid:
+                    continue
+                self._fetching_uid = uid
+                profile = self._get_profile(uid)
+                self._fetching_uid = None
+                if profile is None:
+                    failed += 1
+                    with self._lock:
+                        self._failed_uids.add(uid)
+                else:
+                    with self._lock:
+                        self._profiles[uid] = profile
+                    self._apply_local_rules(uid, profile)
+                    self._emit_matches()
+                fetched += 1
+                if fetched % 5 == 0 or i == len(snapshot) - 1:
+                    self._status("拉取资料中… %d/%d" % (i + 1, len(snapshot)))
+
+            self._run_llm_rules()
+            with self._lock:
+                count = len(self._matches)
+            level = "warn" if failed else "info"
+            self._status("扫描完成：实例内 %d 人，匹配 %d 人" % (len(snapshot), count), level=level)
+            self._emit_matches()
+            self._request_avatars()
+        finally:
+            self._scanning = False
+            self._fetching_uid = None
+            self.last_scan_time = time.time()
+
+    def _get_profile(self, uid):
+        cached, fetched_at = self.cache.get_profile(uid)
+        now = time.time()
+        if cached and now - fetched_at < self.profile_cache_hours * 3600:
+            return cached  # 简介缓存按时间过期（默认 4 小时），期内直接复用
+        try:
+            full = self.api.get_profile(uid)
+        except VRChatAPIError as exc:
+            if exc.status == 401:
+                self._status("Cookie 无效或已过期，请在设置里重新获取", level="error")
+                raise
+            self._status("获取 %s 失败: %s" % (uid, exc), level="warn")
+            return cached  # API 失败时退回过期缓存也比没有强
+        profile = slim_profile(full)
+        profile["_fetched_at"] = time.time()
+        self.cache.put_profile(uid, profile, max_age_seconds=self.profile_cache_hours * 3600)
+        return profile
+
+    def _apply_local_rules(self, uid, profile):
+        """跑所有本地规则并更新该用户的匹配结果。"""
+        with self._lock:
+            entry = self._matches.get(uid) or self._new_entry(uid, profile)
+        hit_rules = []
+        for rule in self._enabled_rules(KEYWORD, REGEX):
+            hits = rules_mod.match_local(rule, profile)
+            if hits:
+                hit_rules.append({
+                    "id": rule.id, "name": rule.name, "type": rule.type,
+                    "reason": "、".join(hits[:5]),
+                })
+        self._update_entry(uid, entry, hit_rules)
+
+    def _run_llm_rules(self):
+        llm_rules = self._enabled_rules(LLM)
+        if not llm_rules:
+            return
+        with self._lock:
+            profiles = dict(self._profiles)
+        users = []
+        for uid, profile in profiles.items():
+            if profile.get("bio") or profile.get("bioLinks"):
+                users.append({
+                    "user_id": uid,
+                    "displayName": profile.get("displayName", ""),
+                    "bio": profile.get("bio", ""),
+                    "bioLinks": profile.get("bioLinks") or [],
+                    "pronouns": profile.get("pronouns", ""),
+                    "tags": profile.get("tags") or [],
+                })
+        if not users:
+            return
+
+        for rule in llm_rules:
+            self._status("LLM 规则「%s」匹配中…" % rule.name)
+            try:
+                results = self.llm.match_rule(
+                    rule, users,
+                    progress=lambda done, total: self._status(
+                        "LLM 规则「%s」%d/%d 人" % (rule.name, done, total)),
+                )
+            except LLMNotConfigured:
+                if not self._llm_warned:
+                    self._llm_warned = True
+                    self._status("LLM 规则已跳过：未配置 API Key（不影响本地规则）", level="warn")
+                return
+            except Exception as exc:
+                self._status("LLM 规则「%s」失败: %s" % (rule.name, exc), level="warn")
+                continue
+
+            for uid, res in results.items():
+                profile = profiles.get(uid)
+                with self._lock:
+                    entry = self._matches.get(uid) or self._new_entry(uid, profile or {})
+                hit_rules = [r for r in entry["rules"] if r["id"] != rule.id]
+                if res.get("match"):
+                    hit_rules.append({
+                        "id": rule.id, "name": rule.name, "type": LLM,
+                        "reason": res.get("reason", ""),
+                    })
+                self._update_entry(uid, entry, hit_rules)
+            self._emit_matches()
+
+    # ---- 状态表（主界面"状态"页用） ----
+
+    def get_roster(self):
+        """当前实例内所有玩家的状态：名字、检测状态、命中的规则（含零命中的）。"""
+        with self._lock:
+            roster = []
+            for p in self._players.values():
+                uid = p.get("user_id", "")
+                entry = {
+                    "user_id": uid,
+                    "name": p.get("name", ""),
+                    "rules": [],
+                    "status": "等待检测",
+                    "bio": "",
+                }
+                if uid and uid == self._local_uid:
+                    entry["status"] = "本机"
+                elif not uid:
+                    entry["status"] = "无法查询"
+                elif uid in self._failed_uids:
+                    entry["status"] = "获取失败"
+                elif uid in self._profiles:
+                    entry["status"] = "已检测"
+                elif self._scanning and self._fetching_uid == uid:
+                    entry["status"] = "检测中"
+                profile = self._profiles.get(uid) or {}
+                entry["bio"] = re.sub(r"\s+", " ", profile.get("bio") or "").strip()
+                match = self._matches.get(uid)
+                if match:
+                    entry["rules"] = [
+                        {"name": r.get("name", ""), "reason": r.get("reason", "")}
+                        for r in match.get("rules", [])
+                    ]
+                roster.append(entry)
+            return roster
+
+    def get_summary(self):
+        """状态页顶栏信息：实例名、人数、匹配数、上次扫描时间。"""
+        with self._lock:
+            return {
+                "instance": self.world_name or self.location or "",
+                "players": len(self._players),
+                "matched": len(self._matches),
+                "last_scan": self.last_scan_time,
+                "scanning": self._scanning,
+            }
+
+    # ---- 匹配表维护 ----
+
+    def _enabled_rules(self, *types):
+        out = []
+        for data in self.config.rules:
+            if not isinstance(data, dict):
+                continue
+            rule = Rule.from_dict(data)
+            if rule.enabled and (not types or rule.type in types):
+                out.append(rule)
+        return out
+
+    def _new_entry(self, uid, profile):
+        return {
+            "user_id": uid,
+            "name": profile.get("displayName", ""),
+            "rules": [],
+            "profile": profile,
+        }
+
+    def _update_entry(self, uid, entry, hit_rules):
+        with self._lock:
+            if hit_rules:
+                entry["rules"] = hit_rules
+                self._matches[uid] = entry
+            else:
+                self._matches.pop(uid, None)
+
+    # ---- 头像 ----
+
+    def _request_avatars(self):
+        with self._lock:
+            items = [(m["user_id"], (m.get("profile") or {}).get("avatar", ""))
+                     for m in self._matches.values()]
+        for uid, url in items:
+            if not url:
+                continue
+            self._avatar_pool.submit(self._fetch_avatar, uid, url)
+
+    def _fetch_avatar(self, uid, url):
+        os.makedirs(self.avatar_dir, exist_ok=True)
+        path = os.path.join(self.avatar_dir, hashlib.md5(uid.encode()).hexdigest() + ".png")
+        data = None
+        if os.path.exists(path):
+            try:
+                with open(path, "rb") as f:
+                    data = f.read()
+            except OSError:
+                data = None
+        if not data:
+            try:
+                resp = requests.get(url, timeout=15)
+                if resp.status_code == 200:
+                    data = resp.content
+                    with open(path, "wb") as f:
+                        f.write(data)
+            except Exception:
+                data = None
+        if data:
+            self.emit({"type": "avatar", "user_id": uid, "data": data})

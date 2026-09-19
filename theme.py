@@ -55,6 +55,28 @@ LINK      = "#6cb2ff"
 CHIP_COLORS = ["#7bd88f", "#69c0ff", "#f5b971", "#e397de", "#66d9e5", "#ffd76e", "#b3a3ff"]
 CHIP_BG = "#33363b"
 
+# 规则标签的可选颜色（18 色，色相彼此错开，深色底上都清晰）
+RULE_COLORS = [
+    "#ff5c5c",  # 红
+    "#ff8c4d",  # 橙
+    "#ffb84d",  # 琥珀
+    "#ffe14d",  # 黄
+    "#d6ff4d",  # 黄绿
+    "#8cff5c",  # 绿
+    "#4dff88",  # 翠
+    "#4dffd2",  # 薄荷
+    "#4de5ff",  # 天青
+    "#4db8ff",  # 天蓝
+    "#5c8cff",  # 蓝
+    "#8c5cff",  # 靛
+    "#b84dff",  # 紫
+    "#e55cff",  # 品红
+    "#ff5cd6",  # 玫
+    "#ff5c8c",  # 粉红
+    "#c0c0c0",  # 灰
+    "#ffffff",  # 白
+]
+
 FONT = "Microsoft YaHei UI"
 
 

@@ -169,7 +169,8 @@ class Overlay:
         name.pack(side="left")
         for rule in match.get("rules", [])[:3]:
             chip = tk.Label(row, text=short_text(rule.get("name", ""), 10), bg=theme.CHIP_BG,
-                            fg=theme.chip_color(rule.get("name", "")), font=TINY_FONT, padx=5, pady=1)
+                            fg=rule.get("color") or theme.chip_color(rule.get("name", "")),
+                            font=TINY_FONT, padx=5, pady=1)
             chip.pack(side="left", padx=(5, 0))
         more = len(match.get("rules", [])) - 3
         if more > 0:
@@ -404,8 +405,8 @@ class Overlay:
             line = tk.Frame(body, bg=BG)
             line.pack(fill="x", pady=(8, 0))
             tk.Label(line, text=rule.get("name", ""), bg=theme.CHIP_BG,
-                     fg=theme.chip_color(rule.get("name", "")), font=SMALL_FONT,
-                     padx=6, pady=1).pack(side="left")
+                     fg=rule.get("color") or theme.chip_color(rule.get("name", "")),
+                     font=SMALL_FONT, padx=6, pady=1).pack(side="left")
             if rule.get("reason"):
                 tk.Label(line, text="  " + rule["reason"], bg=BG, fg=FG_DIM,
                          font=SMALL_FONT).pack(side="left")

@@ -11,6 +11,12 @@ LLM = "llm"
 ALL_FIELDS = ("bio", "bioLinks", "displayName", "pronouns", "statusDescription", "tags")
 
 
+def _valid_color(value):
+    """只接受 #rrggbb 形式的颜色，其他一律清空（回退自动取色）。"""
+    m = re.fullmatch(r"#([0-9a-fA-F]{6})", str(value or "").strip())
+    return "#" + m.group(1).lower() if m else ""
+
+
 @dataclass
 class Rule:
     id: str = ""
@@ -21,6 +27,7 @@ class Rule:
     pattern: str = ""
     fields: list = field(default_factory=lambda: ["bio"])
     prompt: str = ""           # 仅 llm 类型
+    color: str = ""            # 悬浮窗标签颜色（#rrggbb）；空 = 按名字自动取色
     enabled: bool = True
 
     @classmethod
@@ -34,6 +41,7 @@ class Rule:
             pattern=str(data.get("pattern") or ""),
             fields=[str(f) for f in (data.get("fields") or ["bio"]) if str(f) in ALL_FIELDS],
             prompt=str(data.get("prompt") or ""),
+            color=_valid_color(data.get("color")),
             enabled=bool(data.get("enabled", True)),
         )
         if not rule.id:
@@ -48,7 +56,8 @@ class Rule:
         return {
             "id": self.id, "name": self.name, "type": self.type,
             "keywords": self.keywords, "mode": self.mode, "pattern": self.pattern,
-            "fields": self.fields, "prompt": self.prompt, "enabled": self.enabled,
+            "fields": self.fields, "prompt": self.prompt, "color": self.color,
+            "enabled": self.enabled,
         }
 
 

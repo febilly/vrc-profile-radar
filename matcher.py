@@ -278,7 +278,7 @@ class Matcher:
             if hits:
                 hit_rules.append({
                     "id": rule.id, "name": rule.name, "type": rule.type,
-                    "reason": "、".join(hits[:5]),
+                    "reason": "、".join(hits[:5]), "color": rule.color,
                 })
         self._update_entry(uid, entry, hit_rules)
 
@@ -327,7 +327,7 @@ class Matcher:
                 if res.get("match"):
                     hit_rules.append({
                         "id": rule.id, "name": rule.name, "type": LLM,
-                        "reason": res.get("reason", ""),
+                        "reason": res.get("reason", ""), "color": rule.color,
                     })
                 self._update_entry(uid, entry, hit_rules)
             self._emit_matches()

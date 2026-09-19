@@ -101,6 +101,12 @@ def test_rules():
     check("all模式不区分大小写", rules_mod.match_keyword(rule_ci_all, profile_ci) == ["jApAnEsE", "vRcHaT"])
     rule_case_dup = Rule.from_dict({"name": "dup", "type": "keyword", "keywords": ["  VRChat "]})
     check("关键词带空格也可命中", rules_mod.match_keyword(rule_case_dup, profile_ci) == ["VRChat"])
+    check("规则颜色字段保留", Rule.from_dict(
+        {"name": "c", "type": "keyword", "keywords": ["x"], "color": "#8CFF5C"}).color == "#8cff5c")
+    check("非法颜色被清空", Rule.from_dict(
+        {"name": "c", "type": "keyword", "keywords": ["x"], "color": "notacolor"}).color == "")
+    check("无颜色默认自动取色", Rule.from_dict(
+        {"name": "c", "type": "keyword", "keywords": ["x"]}).color == "")
 
 
 def test_cache():
@@ -169,7 +175,8 @@ def test_pipeline():
         cfg_path = os.path.join(tmpdir, "config.json")
         cfg = config_mod.Config(cfg_path)
         cfg.set([
-            {"id": "kw", "name": "日语学习者", "type": "keyword", "keywords": ["日语", "日本語"], "mode": "any"},
+            {"id": "kw", "name": "日语学习者", "type": "keyword", "keywords": ["日语", "日本語"],
+             "mode": "any", "color": "#8cff5c"},
             {"id": "re", "name": "X链接", "type": "regex", "pattern": r"(?:twitter|x)\.com/\w+",
              "fields": ["bio", "bioLinks"]},
             {"id": "llm1", "name": "创作者", "type": "llm", "prompt": "判断是否创作者"},
@@ -214,6 +221,9 @@ def test_pipeline():
             e["name"] == "Alice" and e["rules"] for e in roster), str(roster))
         check("已检测状态标注", any(e["status"] == "已检测" for e in roster),
               str([e["status"] for e in roster]))
+        check("规则颜色透传到命中结果", matches[
+            "usr_aaaaaaaa-1111-2222-3333-444444444444"]["rules"][0].get("color") == "#8cff5c",
+            str(matches["usr_aaaaaaaa-1111-2222-3333-444444444444"]["rules"]))
         check("状态表带简介且无换行", any(
             e["name"] == "Bob_Builder" and "Blender" in e["bio"] and chr(10) not in e["bio"]
             for e in roster), str([e.get("bio", "")[:20] for e in roster]))

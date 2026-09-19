@@ -237,11 +237,42 @@ class RuleEditor(ttk.Frame):
 
         ttk.Label(form, text="名称").grid(row=row, column=0, sticky="e", padx=(0, 6), pady=4)
         name_var = tk.StringVar(value=rule.get("name", ""))
-        name_entry = ttk.Entry(form, textvariable=name_var, width=32)
+        name_entry = ttk.Entry(form, textvariable=name_var, width=18)
         name_entry.grid(row=row, column=1, sticky="w", pady=4)
+
+        # 标签颜色：色板放在名称与启用之间的空闲空间，选中色用于悬浮窗标签文字
+        color_selected = {"v": str(rule.get("color") or "")}
+        color_frame = ttk.Frame(form)
+        color_frame.grid(row=row, column=2, sticky="w", padx=(12, 0))
+        swatches = []
+        for c in theme.RULE_COLORS:
+            sw = tk.Frame(color_frame, width=theme.px(14), height=theme.px(14),
+                          background=c, highlightthickness=1,
+                          highlightbackground=BORDER, highlightcolor=BORDER,
+                          cursor="hand2")
+            sw.pack(side="left", padx=theme.px(1))
+            sw.pack_propagate(False)
+            swatches.append((sw, c))
+            sw.bind("<Button-1>", lambda e, cc=c: pick(cc))
+        theme.add_tooltip(color_frame, "标签颜色：点选应用；再点一次已选颜色恢复自动取色")
+
+        def repaint_color():
+            for sw, c in swatches:
+                sel = color_selected["v"] == c
+                sw.configure(highlightthickness=theme.px(2) if sel else 1,
+                             highlightbackground=FG if sel else BORDER,
+                             highlightcolor=FG if sel else BORDER)
+
+        def pick(cc):
+            color_selected["v"] = "" if color_selected["v"] == cc else cc
+            repaint_color()
+            queue()
+
+        repaint_color()
+
         enabled_var = tk.BooleanVar(value=rule.get("enabled", True))
         ttk.Checkbutton(form, text="启用", variable=enabled_var, command=lambda: queue()).grid(
-            row=row, column=2, sticky="w", padx=(10, 0), pady=4)
+            row=row, column=3, sticky="w", padx=(12, 0), pady=4)
         row += 1
 
         field_vars = {}
@@ -382,6 +413,7 @@ class RuleEditor(ttk.Frame):
             if name:
                 current["name"] = name
             current["enabled"] = bool(enabled_var.get())
+            current["color"] = color_selected["v"]
             if rule.get("type") == KEYWORD:
                 current["keywords"] = list(keywords)
                 if mode_var is not None:

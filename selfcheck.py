@@ -9,7 +9,7 @@ import time
 
 import config as config_mod
 import rules as rules_mod
-from rules import Rule
+from rules import Rule, load_rules_payload, rule_signature, rules_payload
 from vrchat_log import parse_line
 import vrchat_log
 from cache_store import CacheStore
@@ -341,6 +341,40 @@ def test_log_discovery():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def test_rules_import_export():
+    print("== 规则导入导出与去重 ==")
+    entries = [
+        {"name": "规则A", "type": "keyword", "keywords": ["x"], "color": "#8cff5c"},
+        {"name": "规则A", "type": "keyword", "keywords": ["x"], "color": "#8cff5c"},  # 完全相同
+        {"name": "坏规则", "type": "keyword", "keywords": []},                          # 无效
+        {"name": "AI规则", "type": "llm", "prompt": ""},                               # 无效
+    ]
+    rules, skipped = load_rules_payload({"app": "t", "kind": "rules", "rules": entries})
+    check("导入解析+跳过无效条目", len(rules) == 2 and skipped == 2,
+          "%d/%d" % (len(rules), skipped))
+    check("裸数组格式也可导入", load_rules_payload(entries)[0][0].name == "规则A")
+
+    r1 = Rule.from_dict({"name": "同", "type": "keyword", "keywords": ["x"]})
+    r2 = Rule.from_dict({"name": "同", "type": "keyword", "keywords": ["y"]})
+    check("同内容签名相同", rule_signature(r1) == rule_signature(
+        Rule.from_dict({"name": "同", "type": "keyword", "keywords": ["x"]})))
+    check("内容不同签名不同", rule_signature(r1) != rule_signature(r2))
+
+    payload = rules_payload([Rule.from_dict(
+        {"name": "规则A", "type": "keyword", "keywords": ["x"], "color": "#8cff5c"}).to_dict()])
+    check("导出载荷结构", payload["kind"] == "rules" and payload["count"] == 1, repr(payload)[:80])
+    back, skipped2 = load_rules_payload(payload)
+    check("导出→导入往返无损", len(back) == 1 and skipped2 == 0
+          and back[0].name == "规则A" and back[0].color == "#8cff5c")
+
+    # 与现有配置去重：内容相同视为重复
+    existing_rule = Rule.from_dict(
+        {"id": "e1", "name": "已有", "type": "keyword", "keywords": ["z"]})
+    same_content = Rule.from_dict(
+        {"name": "已有", "type": "keyword", "keywords": ["z"]})
+    check("与现有配置去重", rule_signature(same_content) == rule_signature(existing_rule))
+
+
 def run():
     print("开始自检（不联网、不依赖 VRChat）\n")
     test_log_parsing()
@@ -349,6 +383,7 @@ def run():
     test_cache()
     test_extract_json()
     test_config_backup()
+    test_rules_import_export()
     test_pipeline()
     print("\n结果: %d 通过, %d 失败" % (PASS, FAIL))
     return FAIL == 0

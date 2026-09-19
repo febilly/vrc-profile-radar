@@ -7,11 +7,12 @@ import re
 import threading
 import time
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, filedialog
 
 import theme
 from theme import BG, BG_INPUT, BORDER, FG, FG_DIM, OK, ERR, WARN
-from rules import ALL_FIELDS, KEYWORD, REGEX, LLM
+from rules import (ALL_FIELDS, KEYWORD, REGEX, LLM, Rule,
+                   load_rules_payload, rule_signature, rules_payload)
 from overlay import short_text
 
 TYPE_LABEL = {KEYWORD: "关键词", REGEX: "正则", LLM: "AI判断"}
@@ -70,10 +71,14 @@ class MainWindow:
         notebook.pack(fill="both", expand=True, padx=8, pady=8)
         self.rule_editor = RuleEditor(notebook, config)
         self.status_tab = StatusTab(notebook, matcher)
-        self.settings_tab = SettingsTab(notebook, config, matcher, self.apply_hooks, overlay=overlay)
+        self.settings_tab = SettingsTab(notebook, config, matcher, self.apply_hooks,
+                                        overlay=overlay, on_rules_changed=self._reload_rules)
         notebook.add(self.rule_editor, text=" 规则 ")
         notebook.add(self.status_tab, text=" 状态 ")
         notebook.add(self.settings_tab, text=" 设置 ")
+
+    def _reload_rules(self):
+        self.rule_editor._reload_tree()
 
     def show(self):
         self.top.deiconify()
@@ -533,13 +538,82 @@ class StatusTab(ttk.Frame):
             self.tree.insert("", "end", values=(name, status, rules_text, bio), tags=tags)
 
 
+class RulePickDialog(tk.Toplevel):
+    """规则多选对话框（导入/导出共用）：默认全选，带全选/全不选。
+
+    调用方用 wait_window 等待；关闭后 self.result 为选中的 Rule 列表，取消时为 None。
+    """
+
+    def __init__(self, parent, title, rules, confirm_text):
+        super().__init__(parent)
+        self.title(title)
+        self.configure(bg=BG)
+        self.result = None
+        # 注意：不设 transient —— 本程序的 root 是 withdrawn 的，transient 会让对话框跟着隐藏
+        self.rules = list(rules)
+        self.vars = [tk.BooleanVar(value=True) for _ in self.rules]
+
+        bar = ttk.Frame(self, padding=(10, 8))
+        bar.pack(fill="x")
+        ttk.Button(bar, text="全选", style="Tool.TButton",
+                   command=lambda: self._set_all(True)).pack(side="left")
+        ttk.Button(bar, text="全不选", style="Tool.TButton",
+                   command=lambda: self._set_all(False)).pack(side="left", padx=(6, 0))
+        ttk.Label(bar, text="共 %d 条" % len(self.rules), style="Dim.TLabel").pack(
+            side="left", padx=(12, 0))
+
+        body = ttk.Frame(self, padding=(10, 0))
+        body.pack(fill="both", expand=True)
+        canvas = tk.Canvas(body, highlightthickness=0, bg=BG,
+                           height=min(len(self.rules) * theme.px(30) + theme.px(10), theme.px(320)))
+        scroll = ttk.Scrollbar(body, orient="vertical", command=canvas.yview)
+        inner = ttk.Frame(canvas)
+        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=inner, anchor="nw", tags="inner")
+        canvas.configure(yscrollcommand=scroll.set)
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure("inner", width=e.width))
+        canvas.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+
+        for i, rule in enumerate(self.rules):
+            d = rule.to_dict()
+            text = "%s（%s）" % (d.get("name", ""), TYPE_LABEL.get(d.get("type"), ""))
+            summary = rule_summary(d)
+            if summary:
+                text += "　" + summary
+            ttk.Checkbutton(inner, text=text, variable=self.vars[i]).pack(
+                fill="x", anchor="w", pady=1)
+
+        btns = ttk.Frame(self, padding=(10, 8))
+        btns.pack(fill="x", side="bottom")
+        ttk.Button(btns, text="取消", command=self._cancel).pack(side="right")
+        ttk.Button(btns, text=confirm_text, style="Accent.TButton",
+                   command=self._confirm).pack(side="right", padx=(0, 8))
+
+        self.bind("<Escape>", lambda e: self._cancel())
+        self.grab_set()
+
+    def _set_all(self, value):
+        for v in self.vars:
+            v.set(value)
+
+    def _confirm(self):
+        self.result = [r for r, v in zip(self.rules, self.vars) if v.get()]
+        self.destroy()
+
+    def _cancel(self):
+        self.result = None
+        self.destroy()
+
+
 class SettingsTab(ttk.Frame):
-    def __init__(self, parent, config, matcher, apply_hooks, overlay=None):
+    def __init__(self, parent, config, matcher, apply_hooks, overlay=None, on_rules_changed=None):
         super().__init__(parent, padding=8)
         self.config = config
         self.matcher = matcher
         self.apply_hooks = list(apply_hooks)
         self.overlay = overlay
+        self.on_rules_changed = on_rules_changed
         self.vars = {}
         self._apply_after = None
         self._loading = False
@@ -632,6 +706,78 @@ class SettingsTab(ttk.Frame):
                 self._hint("应用失败: %s" % exc, ERR)
                 return
 
+    def _export_rules(self):
+        rules = [Rule.from_dict(r) for r in self.config.rules if isinstance(r, dict)]
+        dlg = RulePickDialog(self, "导出规则：选择要导出的规则", rules, "导出…")
+        self.wait_window(dlg)
+        if dlg.result is None:
+            return
+        if not dlg.result:
+            self._hint("未选择任何规则", WARN)
+            return
+        path = filedialog.asksaveasfilename(
+            parent=self, title="导出规则", defaultextension=".json",
+            initialfile="rules-" + time.strftime("%Y%m%d") + ".json",
+            filetypes=[("JSON 规则文件", "*.json"), ("所有文件", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(rules_payload([r.to_dict() for r in dlg.result]), f,
+                          ensure_ascii=False, indent=2)
+            self._hint("已导出 %d 条规则" % len(dlg.result), OK)
+        except OSError as exc:
+            self._hint("导出失败: %s" % exc, ERR)
+
+    def _import_rules(self):
+        path = filedialog.askopenfilename(
+            parent=self, title="导入规则",
+            filetypes=[("JSON 规则文件", "*.json"), ("所有文件", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError) as exc:
+            self._hint("导入失败：文件无法读取（%s）" % exc, ERR)
+            return
+        parsed, invalid = load_rules_payload(data)
+        if not parsed:
+            self._hint("文件中没有可导入的规则（无效 %d 条）" % invalid, WARN)
+            return
+        dlg = RulePickDialog(self, "导入规则：选择要导入的规则", parsed, "导入…")
+        self.wait_window(dlg)
+        if dlg.result is None:
+            return
+        if not dlg.result:
+            self._hint("未选择任何规则", WARN)
+            return
+
+        existing = self.config.rules
+        used_ids = set()
+        existing_sigs = set()
+        for r in existing:
+            rule = Rule.from_dict(r)
+            used_ids.add(rule.id)
+            existing_sigs.add(rule_signature(rule))
+        imported, skipped = 0, 0
+        for rule in dlg.result:
+            sig = rule_signature(rule)
+            if sig in existing_sigs:
+                skipped += 1   # 与现有规则内容完全相同，去重跳过
+                continue
+            if rule.id in used_ids:
+                rule.id = self.config.new_rule_id()  # id 撞车但内容不同 -> 换新 id
+            existing.append(rule.to_dict())
+            used_ids.add(rule.id)
+            existing_sigs.add(sig)
+            imported += 1
+        if imported:
+            self.config.set(existing, "rules")
+            if self.on_rules_changed:
+                self.on_rules_changed()
+        self._hint("导入 %d 条，跳过重复 %d 条" % (imported, skipped), OK if imported else WARN)
+
     def _hint(self, text, color=FG_DIM):
         self.status_label.config(text=text, foreground=color)
 
@@ -722,6 +868,8 @@ class SettingsTab(ttk.Frame):
         self.status_label.pack(side="left", padx=(10, 0))
         btn(box, "清空 LLM 缓存", self._clear_llm).pack(side="right")
         btn(box, "清空简介缓存", self._clear_profiles).pack(side="right", padx=(0, 8))
+        btn(box, "导入规则", self._import_rules).pack(side="right", padx=(0, 8))
+        btn(box, "导出规则", self._export_rules).pack(side="right", padx=(0, 8))
 
     def _test_cookie(self):
         from vrchat_api import VRChatAPI

@@ -127,3 +127,45 @@ def match_local(rule, profile):
     if rule.type == REGEX:
         return match_regex(rule, profile)
     return []
+
+
+def rule_signature(rule):
+    """规则内容指纹（不含 id 与启用状态）：内容完全相同才视为重复，导入去重用。"""
+    return json.dumps({
+        "name": rule.name, "type": rule.type,
+        "keywords": sorted(rule.keywords), "mode": rule.mode,
+        "pattern": rule.pattern, "fields": sorted(rule.fields),
+        "prompt": rule.prompt, "color": rule.color,
+    }, ensure_ascii=False, sort_keys=True)
+
+
+def rules_payload(rules_dicts):
+    """打包成导出文件载荷。"""
+    return {"app": "vrchat-profile-check", "kind": "rules", "version": 1,
+            "count": len(rules_dicts), "rules": rules_dicts}
+
+
+def load_rules_payload(data):
+    """解析导入文件内容（接受导出载荷或裸数组）。
+
+    返回 (Rule 列表, 无效/不完整条数)。缺必需内容（关键词/正则/判断要求为空）的算无效。
+    """
+    entries = data.get("rules") if isinstance(data, dict) else data
+    if not isinstance(entries, list):
+        return [], 0
+    rules, skipped = [], 0
+    for entry in entries:
+        if not isinstance(entry, dict):
+            skipped += 1
+            continue
+        rule = Rule.from_dict(entry)
+        if rule.type not in (KEYWORD, REGEX, LLM) or not rule.name:
+            skipped += 1
+            continue
+        if ((rule.type == KEYWORD and not rule.keywords)
+                or (rule.type == REGEX and not rule.pattern)
+                or (rule.type == LLM and not rule.prompt)):
+            skipped += 1
+            continue
+        rules.append(rule)
+    return rules, skipped

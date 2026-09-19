@@ -79,7 +79,7 @@ def run_gui(cfg, cache, matcher, demo):
     theme.apply_dark_style(root)
 
     def rebuild_api():
-        matcher.api = build_api(cfg)
+        matcher.set_api(build_api(cfg))
 
     def quit_app():
         root.destroy()               # 悬浮窗/主面板都是它的子窗口，一并关闭

@@ -16,9 +16,31 @@ from concurrent.futures import ThreadPoolExecutor
 import requests
 
 import rules as rules_mod
-from rules import Rule, KEYWORD, REGEX, LLM
+from rules import Rule, KEYWORD, REGEX, LLM, EXCLUDE, MUTUAL, compare_count
 from llm_matcher import LLMMatcher, LLMNotConfigured
 from vrchat_api import VRChatAPIError
+
+FRIENDS_TTL = 900       # 好友列表刷新间隔（秒）
+MUTUAL_TTL = 86400      # 共同好友数缓存时长（秒）
+
+
+def parse_mutual_count(data):
+    """从 /users/{id}/mutuals 响应中解析共同好友数量（隐藏的好友也计入）。
+
+    实测响应形如 {"friends": N, "groups": M}；其余键名作为兼容兜底。
+    """
+    if not isinstance(data, dict):
+        return None
+    for key in ("friends", "friendCount", "friendsCount", "mutualFriendCount",
+                "mutualFriends"):
+        value = data.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int):
+            return value
+        if isinstance(value, list):
+            return len(value)
+    return None
 
 PROFILE_FIELDS = (
     "displayName", "bio", "bioLinks", "pronouns", "tags", "trustTags",
@@ -82,6 +104,12 @@ class Matcher:
         self._cookie_error = False
         self._llm_warned = False
 
+        # 排除/共同好友相关状态
+        self._friends = {}          # Cookie 账号好友：uid -> 名字
+        self._friends_at = 0.0
+        self._friends_loading = False
+        self._me_uid = ""           # Cookie 账号的用户 id（共同好友数以它为基准）
+
         self._lock = threading.RLock()
         self._stop = threading.Event()
         self._wakeup = threading.Event()
@@ -130,6 +158,13 @@ class Matcher:
     def reload_settings(self):
         self.debounce = float(self.config.get("scan", "debounce_seconds", default=3.0) or 3.0)
         self.profile_cache_hours = float(self.config.get("api", "profile_cache_hours", default=4) or 4)
+
+    def set_api(self, api):
+        """替换 API 客户端（设置里换了 Cookie 后调用）：好友/身份缓存一并失效。"""
+        self.api = api
+        self._me_uid = ""
+        self._friends = {}
+        self._friends_at = 0.0
 
     # ---- 日志事件入口 ----
 
@@ -211,7 +246,14 @@ class Matcher:
         self._status("正在拉取 %d 位玩家资料…" % len(snapshot))
         self._scanning = True
         try:
-            fetched, failed = 0, 0
+            self._ensure_friends()
+            excluded = self._compute_excluded()
+            with self._lock:
+                for uid in excluded:
+                    self._matches.pop(uid, None)
+                    self._profiles.pop(uid, None)
+            self._refresh_exclude_names(snapshot)
+            fetched, failed, skipped = 0, 0, 0
             with self._lock:
                 self._failed_uids = set()
             for i, player in enumerate(snapshot):
@@ -220,7 +262,8 @@ class Matcher:
                 uid = player["user_id"]
                 if not uid:
                     continue  # 旧版日志无 usr id，无法查询
-                if uid == self._local_uid:
+                if uid in excluded:
+                    skipped += 1
                     continue
                 self._fetching_uid = uid
                 profile = self._get_profile(uid)
@@ -239,10 +282,13 @@ class Matcher:
                     self._status("拉取资料中… %d/%d" % (i + 1, len(snapshot)))
 
             self._run_llm_rules()
+            self._run_mutual_rules(snapshot, excluded)
             with self._lock:
                 count = len(self._matches)
             level = "warn" if failed else "info"
-            self._status("扫描完成：实例内 %d 人，匹配 %d 人" % (len(snapshot), count), level=level)
+            excluded_note = "，排除 %d 人" % skipped if skipped else ""
+            self._status("扫描完成：实例内 %d 人%s，匹配 %d 人"
+                         % (len(snapshot), excluded_note, count), level=level)
             self._emit_matches()
             self._request_avatars()
         finally:
@@ -332,6 +378,139 @@ class Matcher:
                 self._update_entry(uid, entry, hit_rules)
             self._emit_matches()
 
+    # ---- 排除规则 ----
+
+    def _compute_excluded(self):
+        """所有启用中的排除规则命中的 uid 集合（自己永远在其中，避免匹配到自己）。"""
+        excluded = {self._local_uid} if self._local_uid else set()
+        for rule in self._enabled_rules(EXCLUDE):
+            if rule.exclude_self and self._local_uid:
+                excluded.add(self._local_uid)
+            if rule.exclude_friends:
+                with self._lock:
+                    excluded.update(self._friends.keys())
+            for u in rule.users:
+                uid = u.get("user_id")
+                if uid:
+                    excluded.add(uid)
+        return excluded
+
+    def _refresh_exclude_names(self, snapshot):
+        """排除名单按 uid 匹配；在实例里见到名单成员时同步一次最新名字。"""
+        changed = False
+        by_uid = {p.get("user_id"): p.get("name", "") for p in snapshot if p.get("user_id")}
+        for data in self.config.rules:
+            if not isinstance(data, dict) or data.get("type") != EXCLUDE:
+                continue
+            for u in (data.get("users") or []):
+                uid = u.get("user_id")
+                new_name = by_uid.get(uid)
+                if uid and new_name and u.get("name") != new_name:
+                    u["name"] = new_name
+                    changed = True
+        if changed:
+            self.config.schedule_save()
+
+    def _ensure_friends(self):
+        """有排除规则需要好友数据时，确保好友列表已加载（过期自动刷新）。"""
+        if not any(r.exclude_friends for r in self._enabled_rules(EXCLUDE)):
+            return
+        if self._friends_loading:
+            return
+        if self._friends and time.time() - self._friends_at < FRIENDS_TTL:
+            return
+        self._friends_loading = True
+        threading.Thread(target=self._fetch_friends, daemon=True, name="FriendsFetch").start()
+
+    def _fetch_friends(self):
+        try:
+            friends = self.api.get_friends()
+            with self._lock:
+                self._friends = {
+                    u.get("id", ""): u.get("displayName", "")
+                    for u in friends if isinstance(u, dict) and u.get("id")
+                }
+                self._friends_at = time.time()
+            self._status("好友列表已加载：%d 人" % len(self._friends))
+            self._schedule_scan()  # 好友数据到位后重扫一次，让排除立即生效
+        except VRChatAPIError as exc:
+            if exc.status == 401:
+                self._status("Cookie 无效或已过期，无法加载好友列表", level="error")
+            else:
+                self._status("好友列表加载失败: %s" % exc, level="warn")
+        finally:
+            self._friends_loading = False
+
+    # ---- 共同好友规则 ----
+
+    def _run_mutual_rules(self, snapshot, excluded):
+        rules = self._enabled_rules(MUTUAL)
+        if not rules:
+            return
+        me = self._get_me_uid()
+        if not me:
+            return
+        targets = [p for p in snapshot
+                   if p.get("user_id") and p["user_id"] not in excluded]
+        if not targets:
+            return
+
+        for rule in rules:
+            self._status("共同好友规则「%s」计算中…" % rule.name)
+            for player in targets:
+                uid = player["user_id"]
+                count = self._get_mutual_count(me, uid)
+                if count is None:
+                    continue  # 获取失败且无缓存：跳过，不动已有匹配
+                hit = compare_count(rule.operator, count, rule.count)
+                reason = "共同好友 %d 人" % count
+                with self._lock:
+                    profile = self._profiles.get(uid) or {}
+                    entry = self._matches.get(uid) or self._new_entry(uid, profile)
+                    if not entry.get("name"):
+                        entry["name"] = player.get("name", "")
+                hit_rules = [r for r in entry["rules"] if r["id"] != rule.id]
+                if hit:
+                    hit_rules.append({
+                        "id": rule.id, "name": rule.name, "type": MUTUAL,
+                        "reason": reason, "color": rule.color,
+                    })
+                self._update_entry(uid, entry, hit_rules)
+            self._emit_matches()
+
+    def _get_me_uid(self):
+        """Cookie 账号的用户 id（共同好友数以它为基准），进程内缓存。"""
+        if self._me_uid:
+            return self._me_uid
+        try:
+            me = self.api.get_me()
+        except VRChatAPIError as exc:
+            if exc.status == 401:
+                self._status("Cookie 无效或已过期，请在设置里重新获取", level="error")
+                raise
+            self._status("获取账号信息失败: %s" % exc, level="warn")
+            return ""
+        self._me_uid = me.get("id", "")
+        return self._me_uid
+
+    def _get_mutual_count(self, me, uid):
+        """共同好友数：先查缓存（24h 过期），未命中调 API。失败时退回旧缓存。"""
+        cached, fetched_at = self.cache.get_mutual_count(me, uid)
+        if cached is not None and time.time() - fetched_at < MUTUAL_TTL:
+            return cached
+        try:
+            data = self.api.get_mutual_counts(uid)
+        except VRChatAPIError as exc:
+            if exc.status == 401:
+                raise
+            self._status("获取共同好友数失败: %s" % exc, level="warn")
+            return cached
+        count = parse_mutual_count(data)
+        if count is None:
+            return cached
+        self.cache.put_mutual_count(me, uid, count)
+        return count
+
     # ---- 状态表（主界面"状态"页用） ----
 
     def get_roster(self):
@@ -349,6 +528,8 @@ class Matcher:
                 }
                 if uid and uid == self._local_uid:
                     entry["status"] = "本机"
+                elif uid and uid in self._compute_excluded():
+                    entry["status"] = "已排除"
                 elif not uid:
                     entry["status"] = "无法查询"
                 elif uid in self._failed_uids:

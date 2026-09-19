@@ -1,14 +1,37 @@
-"""规则定义与本地匹配（关键词 / 正则）。LLM 规则的匹配在 llm_matcher.py。"""
+"""规则定义与本地匹配（关键词 / 正则 / 排除 / 共同好友）。LLM 规则的匹配在 llm_matcher.py。"""
 import hashlib
 import json
+import operator
 import re
 from dataclasses import dataclass, field
 
 KEYWORD = "keyword"
 REGEX = "regex"
 LLM = "llm"
+EXCLUDE = "exclude"
+MUTUAL = "mutual_friends"
 
 ALL_FIELDS = ("bio", "bioLinks", "displayName", "pronouns", "statusDescription", "tags")
+
+# 共同好友规则可用的比较运算符
+OPERATORS = {
+    ">=": operator.ge,
+    ">": operator.gt,
+    "=": operator.eq,
+    "<=": operator.le,
+    "<": operator.lt,
+}
+
+OPERATOR_DISPLAY = {">=": "≥", ">": ">", "=": "=", "<=": "≤", "<": "<"}
+
+
+def compare_count(operator_str, count, threshold):
+    """count 与阈值按运算符比较；非法输入一律 False。"""
+    fn = OPERATORS.get(operator_str, operator.ge)
+    try:
+        return fn(int(count), int(threshold))
+    except (TypeError, ValueError):
+        return False
 
 
 def _valid_color(value):
@@ -29,9 +52,27 @@ class Rule:
     prompt: str = ""           # 仅 llm 类型
     color: str = ""            # 悬浮窗标签颜色（#rrggbb）；空 = 按名字自动取色
     enabled: bool = True
+    # exclude 类型：命中任一所选条件的玩家从悬浮窗结果中剔除
+    exclude_self: bool = False                 # 排除游戏客户端登录的玩家（自己）
+    exclude_friends: bool = False              # 排除 Cookie 账号的好友
+    users: list = field(default_factory=list)  # 名单 [{"user_id", "name"}]，按 uid 排除
+    # mutual_friends 类型：与 Cookie 账号的共同好友数满足比较条件
+    operator: str = ">="
+    count: int = 5
 
     @classmethod
     def from_dict(cls, data):
+        users = []
+        for u in (data.get("users") or []):
+            if isinstance(u, dict) and u.get("user_id"):
+                users.append({"user_id": str(u["user_id"]), "name": str(u.get("name", ""))})
+        try:
+            count = int(data.get("count", 5))
+        except (TypeError, ValueError):
+            count = 5
+        op = str(data.get("operator", ">="))
+        if op not in OPERATORS:
+            op = ">="
         rule = cls(
             id=str(data.get("id") or ""),
             name=str(data.get("name") or "未命名规则"),
@@ -43,6 +84,11 @@ class Rule:
             prompt=str(data.get("prompt") or ""),
             color=_valid_color(data.get("color")),
             enabled=bool(data.get("enabled", True)),
+            exclude_self=bool(data.get("exclude_self", False)),
+            exclude_friends=bool(data.get("exclude_friends", False)),
+            users=users,
+            operator=op,
+            count=count,
         )
         if not rule.id:
             rule.id = "rule-" + hashlib.md5(
@@ -58,6 +104,8 @@ class Rule:
             "keywords": self.keywords, "mode": self.mode, "pattern": self.pattern,
             "fields": self.fields, "prompt": self.prompt, "color": self.color,
             "enabled": self.enabled,
+            "exclude_self": self.exclude_self, "exclude_friends": self.exclude_friends,
+            "users": self.users, "operator": self.operator, "count": self.count,
         }
 
 
@@ -68,6 +116,8 @@ def rule_hash(rule):
     elif rule.type == KEYWORD:
         payload = {"type": KEYWORD, "keywords": sorted(rule.keywords), "mode": rule.mode,
                    "fields": sorted(rule.fields)}
+    elif rule.type == MUTUAL:
+        payload = {"type": MUTUAL, "operator": rule.operator, "count": rule.count}
     else:
         payload = {"type": REGEX, "pattern": rule.pattern, "fields": sorted(rule.fields)}
     return hashlib.sha256(
@@ -136,6 +186,9 @@ def rule_signature(rule):
         "keywords": sorted(rule.keywords), "mode": rule.mode,
         "pattern": rule.pattern, "fields": sorted(rule.fields),
         "prompt": rule.prompt, "color": rule.color,
+        "exclude_self": rule.exclude_self, "exclude_friends": rule.exclude_friends,
+        "users": sorted(u.get("user_id", "") for u in rule.users),
+        "operator": rule.operator, "count": rule.count,
     }, ensure_ascii=False, sort_keys=True)
 
 
@@ -148,7 +201,8 @@ def rules_payload(rules_dicts):
 def load_rules_payload(data):
     """解析导入文件内容（接受导出载荷或裸数组）。
 
-    返回 (Rule 列表, 无效/不完整条数)。缺必需内容（关键词/正则/判断要求为空）的算无效。
+    返回 (Rule 列表, 无效/不完整条数)。缺必需内容（关键词/正则/判断要求为空、
+    排除规则一个条件都没选）的算无效。
     """
     entries = data.get("rules") if isinstance(data, dict) else data
     if not isinstance(entries, list):
@@ -159,12 +213,14 @@ def load_rules_payload(data):
             skipped += 1
             continue
         rule = Rule.from_dict(entry)
-        if rule.type not in (KEYWORD, REGEX, LLM) or not rule.name:
+        if rule.type not in (KEYWORD, REGEX, LLM, EXCLUDE, MUTUAL) or not rule.name:
             skipped += 1
             continue
         if ((rule.type == KEYWORD and not rule.keywords)
                 or (rule.type == REGEX and not rule.pattern)
-                or (rule.type == LLM and not rule.prompt)):
+                or (rule.type == LLM and not rule.prompt)
+                or (rule.type == EXCLUDE and not rule.exclude_self
+                    and not rule.exclude_friends and not rule.users)):
             skipped += 1
             continue
         rules.append(rule)

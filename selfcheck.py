@@ -9,12 +9,13 @@ import time
 
 import config as config_mod
 import rules as rules_mod
-from rules import Rule, load_rules_payload, rule_signature, rules_payload
+from rules import Rule, load_rules_payload, rule_signature, rules_payload, compare_count
 from vrchat_log import parse_line
 import vrchat_log
 from cache_store import CacheStore
 from llm_matcher import extract_json
 from matcher import Matcher
+from trust import user_trust
 
 PASS = 0
 FAIL = 0
@@ -109,6 +110,58 @@ def test_rules():
         {"name": "c", "type": "keyword", "keywords": ["x"]}).color == "")
 
 
+def test_trust_levels():
+    print("== 信任等级（VRCX 映射） ==")
+    name, color, sort = user_trust([])
+    check("无tag = Visitor", name == "Visitor" and color == "#CCCCCC" and sort == 1, "%s/%s" % (name, color))
+    name, color, _ = user_trust(["system_trust_basic"])
+    check("basic = New User 蓝", name == "New User" and color == "#1778FF")
+    name, color, _ = user_trust(["system_trust_known"])
+    check("known = User 绿", name == "User" and color == "#2BCF5C")
+    name, color, _ = user_trust(["system_trust_trusted"])
+    check("trusted = Known User 橙", name == "Known User" and color == "#FF7B42")
+    # veteran 标签已被 VRChat 淘汰：存量账号显示为 Trusted User（紫色），不再显示 Veteran
+    name, color, sort = user_trust(["system_trust_veteran"])
+    check("veteran(淘汰) 显示为 Trusted User 紫", name == "Trusted User" and color == "#B18FFF" and sort == 5)
+    name, color, _ = user_trust(["system_trust_basic"], "developer")
+    check("开发者红色覆盖", color == "#FF2626")
+    name, color, _ = user_trust(["system_troll", "system_trust_trusted"])
+    check("troll 颜色覆盖", color == "#782F2F")
+    name, _, _ = user_trust(None)
+    check("tags为None不崩溃", name == "Visitor")
+
+
+def test_exclude_mutual_rules():
+    print("== 排除/共同好友规则 ==")
+    # 运算符
+    check(">= 运算符", compare_count(">=", 5, 5) and not compare_count(">=", 4, 5))
+    check("> 运算符", compare_count(">", 6, 5) and not compare_count(">", 5, 5))
+    check("= 运算符", compare_count("=", 5, 5) and not compare_count("=", 6, 5))
+    check("<= 运算符", compare_count("<=", 5, 5) and compare_count("<=", 4, 5))
+    check("< 运算符", compare_count("<", 4, 5) and not compare_count("<", 5, 5))
+    check("非法输入 False", not compare_count(">=", None, 5) and not compare_count(">=", "abc", 5))
+
+    rule = Rule.from_dict({"name": "排", "type": "exclude", "exclude_self": True,
+                           "exclude_friends": True,
+                           "users": [{"user_id": "usr_abc", "name": "某人"}, "坏条目"]})
+    check("排除规则解析", rule.exclude_self and rule.exclude_friends
+          and rule.users == [{"user_id": "usr_abc", "name": "某人"}])
+    check("排除规则无uid条目被丢弃", len(rule.users) == 1)
+    mrule = Rule.from_dict({"name": "共", "type": "mutual_friends", "operator": "le", "count": "7"})
+    check("共同好友规则解析+非法运算符回退", mrule.operator == ">=" and mrule.count == 7)
+    mrule2 = Rule.from_dict({"name": "共2", "type": "mutual_friends", "operator": "<=", "count": "x"})
+    check("共同好友数量非法回退默认5", mrule2.operator == "<=" and mrule2.count == 5)
+    check("规则to_dict往返", Rule.from_dict(rule.to_dict()).users == rule.users)
+
+    # 导入导出：排除/共同好友是合法类型；排除规则一个条件都没选算无效
+    ok, skipped = load_rules_payload([
+        {"name": "排", "type": "exclude", "exclude_self": True},
+        {"name": "空排", "type": "exclude"},
+        {"name": "共", "type": "mutual_friends"},
+    ])
+    check("导入支持排除/共同好友", len(ok) == 2 and skipped == 1, "%d/%d" % (len(ok), skipped))
+
+
 def test_cache():
     print("== 缓存 ==")
     tmpdir = tempfile.mkdtemp()
@@ -154,6 +207,19 @@ def test_cache():
         check("LLM缓存超限淘汰最久未用", store.get_llm("k2") is None)
         check("LLM缓存命中过的保留", store.get_llm("k1") is not None)
         check("LLM缓存其余保留", store.get_llm("k3") is not None and store.get_llm("k4") is not None)
+
+        # 共同好友数缓存
+        store.put_mutual_count("me", "usr_a", 7)
+        count, fetched_at = store.get_mutual_count("me", "usr_a")
+        check("共同好友缓存读写", count == 7 and fetched_at > 0)
+        check("共同好友缓存未命中", store.get_mutual_count("me", "usr_b") == (None, 0.0))
+        store.put_mutual_count("me", "usr_a", 9)
+        check("共同好友缓存覆盖", store.get_mutual_count("me", "usr_a")[0] == 9)
+        check("不同me键隔离", store.get_mutual_count("other", "usr_a") == (None, 0.0))
+        store.put_profile("usr_z", {"displayName": "Z"})
+        store.clear_profiles()
+        check("清空简介缓存连共同好友一起清", store.get_mutual_count("me", "usr_a") == (None, 0.0)
+              and store.get_profile("usr_z")[0] is None)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -275,6 +341,97 @@ def test_pipeline():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def test_pipeline_exclusion():
+    print("== 排除与共同好友流水线（假数据） ==")
+    tmpdir = tempfile.mkdtemp()
+    try:
+        cfg_path = os.path.join(tmpdir, "config.json")
+        cfg = config_mod.Config(cfg_path)
+        cfg.set([
+            {"id": "kw", "name": "关键词", "type": "keyword",
+             "keywords": ["日语", "日本語", "做模型"], "mode": "any"},
+            {"id": "re", "name": "X链接", "type": "regex",
+             "pattern": r"(?:twitter|x)\.com/\w+", "fields": ["bio", "bioLinks"]},
+            # Alice 是 Cookie 账号好友（demo.FakeAPI.get_friends），应被好友排除；
+            # Bob 在名单里，应被名单排除 —— 即使他们命中上面的正向规则
+            {"id": "ex", "name": "排除", "type": "exclude", "exclude_self": True,
+             "exclude_friends": True,
+             "users": [{"user_id": "usr_dddddddd-1111-2222-3333-444444444444",
+                        "name": "Bob_Builder"}]},
+            # Charlie 假数据共同好友 10 个（≥5 命中），Jack 2 个（不命中）
+            {"id": "mu", "name": "共同好友", "type": "mutual_friends",
+             "operator": ">=", "count": 5},
+        ], "rules")
+        cfg.set("", "cookies", "auth")
+
+        from cache_store import CacheStore
+        import demo
+        cache = CacheStore(os.path.join(tmpdir, "cache.db"))
+        matcher = Matcher(cfg, cache, api=None)
+        demo.setup(matcher, cfg)
+        matcher.start()
+
+        deadline = time.time() + 30
+        names = set()
+        while time.time() < deadline:
+            with matcher._lock:
+                matches = {m["user_id"]: m for m in matcher._matches.values()}
+            names = {m["name"] for m in matches.values()}
+            if "Charlie" in names:
+                break
+            time.sleep(0.2)
+
+        check("好友排除：Alice 命中正则但被排除", "Alice" not in names, str(names))
+        check("名单排除：Bob 被排除", "Bob_Builder" not in names, str(names))
+        check("排除不影响其他人：星野/Jack 仍命中关键词",
+              {"星野くるみ", "Jack_Miller"} <= names, str(names))
+        check("共同好友≥5：Charlie 命中", "Charlie" in names, str(names))
+        jack_rules = {r["name"] for r in matches[
+            "usr_bbbbbbbb-1111-2222-3333-444444444444"]["rules"]} if \
+            "usr_bbbbbbbb-1111-2222-3333-444444444444" in matches else set()
+        check("共同好友<5：Jack 只有关键词命中", "共同好友" not in jack_rules, str(jack_rules))
+        charlie_rules = {r["name"]: r.get("reason", "") for r in matches[
+            "usr_eeeeeeee-1111-2222-3333-444444444444"]["rules"]} if \
+            "usr_eeeeeeee-1111-2222-3333-444444444444" in matches else {}
+        check("共同好友理由带数量", charlie_rules.get("共同好友") == "共同好友 10 人",
+              str(charlie_rules))
+        check("自己永远被排除", "DemoLocalUser" not in names)
+
+        # 好友列表已加载且来源正确
+        with matcher._lock:
+            friends = dict(matcher._friends)
+        check("好友列表已加载", "usr_cccccccc-1111-2222-3333-444444444444" in friends, str(friends))
+        # 共同好友数已按 (me, uid) 落库
+        count, fetched_at = cache.get_mutual_count(
+            "usr_11111111-1111-1111-1111-111111111111",
+            "usr_eeeeeeee-1111-2222-3333-444444444444")
+        check("共同好友数已缓存", count == 10 and fetched_at > 0, str((count, fetched_at)))
+
+        # 状态表：被排除的玩家显示"已排除"
+        roster = matcher.get_roster()
+        status_by_name = {e["name"]: e["status"] for e in roster}
+        check("状态表标注已排除",
+              status_by_name.get("Alice") == "已排除" and status_by_name.get("Bob_Builder") == "已排除",
+              str(status_by_name))
+
+        # 共同好友数缓存生效：重扫不再调用 mutual 接口
+        calls = {"n": 0}
+        real_mutual = matcher.api.get_mutual_counts
+
+        def counting_mutual(uid):
+            calls["n"] += 1
+            return real_mutual(uid)
+
+        matcher.api.get_mutual_counts = counting_mutual
+        matcher.handle_log_event({"kind": "join", "name": "Diana",
+                                  "user_id": "usr_ffffffff-1111-2222-3333-444444444444"})
+        time.sleep(4)
+        check("共同好友缓存生效：重扫不重复调用", calls["n"] <= 1, str(calls["n"]))
+        matcher.stop()
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def test_config_backup():
     print("== 配置备份与恢复 ==")
     tmpdir = tempfile.mkdtemp()
@@ -379,12 +536,15 @@ def run():
     print("开始自检（不联网、不依赖 VRChat）\n")
     test_log_parsing()
     test_log_discovery()
+    test_trust_levels()
     test_rules()
+    test_exclude_mutual_rules()
     test_cache()
     test_extract_json()
     test_config_backup()
     test_rules_import_export()
     test_pipeline()
+    test_pipeline_exclusion()
     print("\n结果: %d 通过, %d 失败" % (PASS, FAIL))
     return FAIL == 0
 

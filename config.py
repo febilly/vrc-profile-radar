@@ -39,6 +39,15 @@ EXAMPLE_RULES = [
         "enabled": True,
     },
     {
+        "id": "example-exclude",
+        "name": "排除",
+        "type": "exclude",
+        "exclude_self": True,
+        "exclude_friends": False,
+        "users": [],
+        "enabled": True,
+    },
+    {
         "id": "example-llm",
         "name": "VRChat创作者(AI判断)",
         "type": "llm",

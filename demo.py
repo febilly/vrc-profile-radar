@@ -85,6 +85,15 @@ class FakeAPI:
     def get_me(self):
         return {"displayName": "DemoLocalUser", "id": LOCAL_UID}
 
+    def get_friends(self):
+        """假好友列表：Alice 是 Cookie 账号（演示里即本机账号）的好友。"""
+        return [{"id": "usr_cccccccc-1111-2222-3333-444444444444", "displayName": "Alice"}]
+
+    def get_mutual_counts(self, user_id):
+        """假共同好友计数（响应形状与真实 API 一致）：Charlie 10 个，其他人 2 个。"""
+        return {"friends": 10 if user_id == "usr_eeeeeeee-1111-2222-3333-444444444444" else 2,
+                "groups": 0}
+
     def get_profile(self, user_id):
         time.sleep(self.latency)
         profile = self.by_id.get(user_id)

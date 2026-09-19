@@ -1,13 +1,17 @@
 """VRChat API 客户端：用 auth / twoFactorAuth cookie 直接调用，带限流与重试。
 
 接口基址 https://api.vrchat.cloud/api/1
-  GET /auth/user      验证 cookie，返回自己的资料
-  GET /users/{userId} 返回指定用户资料（bio、bioLinks、头像缩略图等）
+  GET /auth/user            验证 cookie，返回自己的用户对象
+  GET /profile/{userId}     返回完整资料（bio、bioLinks、头像缩略图等；/users/{id} 已只给精简对象）
+  GET /users?search=        按名字搜索玩家（返回精简对象：id、名字、tags、头像等）
+  GET /auth/user/friends    好友列表（offset 分页）
+  GET /users/{id}/mutuals   与某玩家的共同好友/群组计数（隐藏的共同好友也计入 friendCount）
 VRChat 要求自定义 User-Agent（带联系方式），并明确要求控制请求频率，这里默认 2 req/s，
 收到 429 时按 Retry-After 退避并自动降低速率。
 """
 import threading
 import time
+import urllib.parse
 
 import requests
 
@@ -114,3 +118,26 @@ class VRChatAPI:
         """新接口：/profile/{userId} 是当前唯一还返回 bio/bioLinks/头像的端点
         （2025-09 API 变更后，/users/{id} 与搜索都只返回精简对象）。"""
         return self._request("/profile/" + user_id)
+
+    def search_users(self, name, n=20):
+        """按名字搜索玩家，返回精简用户对象列表（id、displayName、tags、头像等）。"""
+        return self._request("/users?search=%s&n=%d" % (urllib.parse.quote(name), int(n)))
+
+    def get_friends(self):
+        """当前 Cookie 账号的全部好友（精简对象），自动翻页。"""
+        out = []
+        offset = 0
+        page = 50
+        while offset <= 4000:  # 上限保护，防接口异常时死循环
+            batch = self._request("/auth/user/friends?offset=%d&n=%d" % (offset, page))
+            if not isinstance(batch, list):
+                break
+            out.extend(batch)
+            if len(batch) < page:
+                break
+            offset += page
+        return out
+
+    def get_mutual_counts(self, user_id):
+        """与某玩家的共同项计数：{"friendCount": N, "groupCount": M}（隐藏的共同好友也计入）。"""
+        return self._request("/users/%s/mutuals" % user_id)

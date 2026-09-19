@@ -3,6 +3,7 @@
 所有更改即时生效并自动保存（内存立即更新、写盘防抖合并、副作用去抖应用），无保存按钮。
 与悬浮窗分离：悬浮窗只负责游戏内显示匹配结果；主面板负责配置，关掉即隐藏。
 """
+import json
 import re
 import threading
 import time
@@ -11,13 +12,19 @@ from tkinter import ttk, filedialog
 
 import theme
 from theme import BG, BG_INPUT, BORDER, FG, FG_DIM, OK, ERR, WARN
-from rules import (ALL_FIELDS, KEYWORD, REGEX, LLM, Rule,
-                   load_rules_payload, rule_signature, rules_payload)
+from rules import (ALL_FIELDS, KEYWORD, REGEX, LLM, EXCLUDE, MUTUAL, Rule,
+                   OPERATOR_DISPLAY, load_rules_payload, rule_signature, rules_payload)
 from overlay import short_text
 
-TYPE_LABEL = {KEYWORD: "关键词", REGEX: "正则", LLM: "AI判断"}
+TYPE_LABEL = {KEYWORD: "关键词", REGEX: "正则", LLM: "AI判断",
+              EXCLUDE: "排除", MUTUAL: "共同好友"}
 FIELD_LABELS = {"bio": "简介", "bioLinks": "链接", "displayName": "昵称",
                 "pronouns": "代词", "statusDescription": "状态描述", "tags": "标签"}
+
+# 共同好友规则：界面显示符号 <-> 配置存储的运算符
+OP_DISPLAY_LIST = ["≥", ">", "=", "≤", "<"]
+OP_FROM_DISPLAY = {"≥": ">=", ">": ">", "=": "=", "≤": "<=", "<": "<"}
+OP_TO_DISPLAY = {v: k for k, v in OP_FROM_DISPLAY.items()}
 
 INT_KEYS = {("llm", "batch_size"), ("llm", "concurrency"), ("llm", "result_cache_max")}
 FLOAT_KEYS = {("api", "requests_per_second"), ("scan", "debounce_seconds"), ("api", "profile_cache_hours")}
@@ -39,6 +46,19 @@ def rule_summary(rule):
         return short_text(rule.get("pattern") or "", 14)
     if t == LLM:
         return short_text(rule.get("prompt") or "", 14)
+    if t == EXCLUDE:
+        parts = []
+        if rule.get("exclude_self"):
+            parts.append("自己")
+        if rule.get("exclude_friends"):
+            parts.append("好友")
+        users = rule.get("users") or []
+        if users:
+            parts.append("名单%d人" % len(users))
+        return "排除：" + ("、".join(parts) if parts else "未选条件")
+    if t == MUTUAL:
+        return "共同好友%s%s人" % (OPERATOR_DISPLAY.get(rule.get("operator", ">="), "≥"),
+                                rule.get("count", 5))
     return ""
 
 
@@ -69,7 +89,7 @@ class MainWindow:
 
         notebook = ttk.Notebook(self.top)
         notebook.pack(fill="both", expand=True, padx=8, pady=8)
-        self.rule_editor = RuleEditor(notebook, config)
+        self.rule_editor = RuleEditor(notebook, config, get_api=lambda: self.matcher.api)
         self.status_tab = StatusTab(notebook, matcher)
         self.settings_tab = SettingsTab(notebook, config, matcher, self.apply_hooks,
                                         overlay=overlay, on_rules_changed=self._reload_rules)
@@ -94,9 +114,10 @@ class MainWindow:
 
 
 class RuleEditor(ttk.Frame):
-    def __init__(self, parent, config):
+    def __init__(self, parent, config, get_api=None):
         super().__init__(parent, padding=6)
         self.config = config
+        self.get_api = get_api or (lambda: None)
         self.selected_id = None
         self._pending_wb = {}     # rule_id -> writeback 函数
         self._wb_after = None
@@ -106,6 +127,8 @@ class RuleEditor(ttk.Frame):
         btn(bar, "＋关键词", lambda: self._add(KEYWORD)).pack(side="left")
         btn(bar, "＋正则", lambda: self._add(REGEX)).pack(side="left", padx=(4, 0))
         btn(bar, "＋AI", lambda: self._add(LLM)).pack(side="left", padx=(4, 0))
+        btn(bar, "＋排除", lambda: self._add(EXCLUDE)).pack(side="left", padx=(4, 0))
+        btn(bar, "＋共同好友", lambda: self._add(MUTUAL)).pack(side="left", padx=(4, 0))
         btn(bar, "复制", self._copy_rule).pack(side="left", padx=(12, 0))
         btn(bar, "删除", self._delete).pack(side="left", padx=(4, 0))
         btn(bar, "上移", lambda: self._move(-1)).pack(side="left", padx=(12, 0))
@@ -198,6 +221,9 @@ class RuleEditor(ttk.Frame):
             KEYWORD: {"name": "新关键词规则", "keywords": [], "mode": "any", "fields": ["bio"]},
             REGEX: {"name": "新正则规则", "pattern": "", "fields": ["bio", "bioLinks"]},
             LLM: {"name": "新AI规则", "prompt": ""},
+            EXCLUDE: {"name": "排除规则", "exclude_self": True, "exclude_friends": False,
+                      "users": []},
+            MUTUAL: {"name": "新共同好友规则", "operator": ">=", "count": 5},
         }
         rule = {"id": self.config.new_rule_id(), "type": rule_type, "enabled": True,
                 **defaults[rule_type]}
@@ -409,6 +435,86 @@ class RuleEditor(ttk.Frame):
 
             prompt_text.bind("<<Modified>>", on_prompt_modified)
             row += 1
+        elif rule.get("type") == EXCLUDE:
+            self_var = tk.BooleanVar(value=rule.get("exclude_self", False))
+            ttk.Checkbutton(form, text="排除自己（游戏客户端登录的玩家）", variable=self_var,
+                            command=lambda: queue()).grid(row=row, column=1, sticky="w", pady=4)
+            row += 1
+            friends_var = tk.BooleanVar(value=rule.get("exclude_friends", False))
+            ttk.Checkbutton(form, text="排除好友（Cookie 账号的好友）", variable=friends_var,
+                            command=lambda: queue()).grid(row=row, column=1, sticky="w", pady=4)
+            row += 1
+            ttk.Label(form, text="排除名单（按 uid）").grid(row=row, column=0, sticky="ne", padx=(0, 6), pady=4)
+            list_row = row
+            users = [dict(u) for u in (rule.get("users") or [])]
+            kw_box = ttk.Frame(form)
+            kw_box.grid(row=row, column=1, columnspan=2, sticky="nsew", pady=4)
+
+            list_wrap = ttk.Frame(kw_box)
+            list_wrap.pack(side="left", fill="both", expand=True)
+            users_listbox = tk.Listbox(list_wrap, height=6, bg=BG_INPUT, fg=FG, relief="flat",
+                                       highlightthickness=1, highlightbackground=BORDER,
+                                       selectbackground="#34435c", font=(theme.FONT, 9),
+                                       exportselection=False, activestyle="none")
+            users_listbox.pack(side="left", fill="both", expand=True)
+            users_scroll = ttk.Scrollbar(list_wrap, orient="vertical", command=users_listbox.yview)
+            users_scroll.pack(side="left", fill="y")
+            users_listbox.config(yscrollcommand=users_scroll.set)
+
+            def render_users():
+                users_listbox.delete(0, "end")
+                for u in users:
+                    users_listbox.insert("end", "%s  (%s)" % (u.get("name", "?"), u.get("user_id", "")))
+
+            for u in users:
+                users_listbox.insert("end", "%s  (%s)" % (u.get("name", "?"), u.get("user_id", "")))
+
+            def del_user(_=None):
+                for i in reversed(users_listbox.curselection()):
+                    del users[i]
+                    users_listbox.delete(i)
+                queue()
+
+            def search_add():
+                from user_search_dialog import UserSearchDialog
+
+                def on_pick(user):
+                    uid = user.get("id", "")
+                    if not uid:
+                        return
+                    if any(u.get("user_id") == uid for u in users):
+                        err_label.config(text="已在名单里：%s" % short_text(
+                            user.get("displayName", ""), 12), foreground=WARN)
+                        return
+                    users.append({"user_id": uid, "name": user.get("displayName", "")})
+                    render_users()
+                    err_label.config(text="")
+                    queue()
+
+                UserSearchDialog(self, self.get_api, on_pick, title="搜索玩家加入排除名单")
+
+            tools = ttk.Frame(kw_box)
+            tools.pack(side="left", fill="y", padx=(8, 0))
+            btn(tools, "搜索添加…", search_add).pack(fill="x", pady=(6, 0))
+            btn(tools, "删除选中", del_user).pack(fill="x", pady=(4, 0))
+            users_listbox.bind("<Double-Button-1>", del_user)
+            theme.add_tooltip(users_listbox, "双击条目可从名单移除")
+            row += 1
+        elif rule.get("type") == MUTUAL:
+            ttk.Label(form, text="共同好友数量").grid(row=row, column=0, sticky="e", padx=(0, 6), pady=4)
+            op_box = ttk.Frame(form)
+            op_box.grid(row=row, column=1, columnspan=2, sticky="w", pady=4)
+            op_var = tk.StringVar(value=OP_TO_DISPLAY.get(rule.get("operator", ">="), "≥"))
+            ttk.Combobox(op_box, textvariable=op_var, values=OP_DISPLAY_LIST,
+                         width=4, state="readonly").pack(side="left")
+            count_var = tk.StringVar(value=str(rule.get("count", 5)))
+            ttk.Entry(op_box, textvariable=count_var, width=8).pack(side="left", padx=(8, 0))
+            ttk.Label(op_box, text="人（与 Cookie 账号的共同好友，不含共同群组；"
+                                   "对方隐藏的共同好友也计入）",
+                      style="Dim.TLabel").pack(side="left", padx=(8, 0))
+            op_var.trace_add("write", lambda *_: queue())
+            count_var.trace_add("write", lambda *_: queue())
+            row += 1
 
         if rule.get("type") in (KEYWORD, REGEX):
             ttk.Label(form, text="匹配范围").grid(row=row, column=0, sticky="e", padx=(0, 6), pady=4)
@@ -424,6 +530,8 @@ class RuleEditor(ttk.Frame):
         err_label.grid(row=row, column=0, columnspan=3, sticky="w", pady=(8, 0))
         if rule.get("type") in (KEYWORD, LLM):
             form.rowconfigure(1, weight=1)  # 关键词列表 / AI 提示词占满剩余高度
+        if rule.get("type") == EXCLUDE:
+            form.rowconfigure(list_row, weight=1)  # 排除名单占满剩余高度
         form.columnconfigure(1, weight=1)
 
         def writeback():
@@ -454,6 +562,22 @@ class RuleEditor(ttk.Frame):
                     err_label.config(text="")
                 else:
                     err_label.config(text="判断要求不能为空（暂保留原内容）", foreground=WARN)
+            elif rule.get("type") == EXCLUDE:
+                current["exclude_self"] = bool(self_var.get())
+                current["exclude_friends"] = bool(friends_var.get())
+                current["users"] = list(users)
+                if not (self_var.get() or friends_var.get() or users):
+                    err_label.config(text="还没有选择任何排除条件，此规则不会排除任何人", foreground=WARN)
+                else:
+                    err_label.config(text="")
+            elif rule.get("type") == MUTUAL:
+                current["operator"] = OP_FROM_DISPLAY.get(op_var.get(), ">=")
+                try:
+                    current["count"] = int(count_var.get())
+                    err_label.config(text="")
+                except ValueError:
+                    err_label.config(text="数量需为整数（暂保留原值 %s）" % current.get("count", 5),
+                                     foreground=WARN)
             self._refresh_tree_item(current)
             self.config.schedule_save()
 
@@ -479,6 +603,7 @@ class StatusTab(ttk.Frame):
         "获取失败": ERR,
         "无法查询": FG_DIM,
         "本机": FG_DIM,
+        "已排除": FG_DIM,
     }
 
     def __init__(self, parent, matcher):

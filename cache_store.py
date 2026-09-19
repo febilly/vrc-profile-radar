@@ -1,9 +1,10 @@
-"""SQLite 本地缓存，两套互相独立：
+"""SQLite 本地缓存，三套互相独立：
 
 1. 玩家简介缓存（profiles）：按"获取时间"绝对过期（默认 4 小时，可在设置里调），
    过期后重新调用 VRChat API 拉取资料。
 2. LLM 结果缓存（llm_results）：把"某段简介 + 某条规则"交给大模型得到的结果存下来，
    只要简介和规则没变就一直复用（不重复花钱）；按数量上限（默认 10000 条）淘汰最久未用的。
+3. 共同好友数缓存（mutual_counts）：按 (Cookie 账号, 目标玩家) 存共同好友数量，绝对过期。
 """
 import json
 import sqlite3
@@ -22,6 +23,11 @@ class CacheStore:
         self._conn.execute(
             "CREATE TABLE IF NOT EXISTS llm_results ("
             " cache_key TEXT PRIMARY KEY, result TEXT NOT NULL, created_at REAL NOT NULL)"
+        )
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS mutual_counts ("
+            " me TEXT NOT NULL, user_id TEXT NOT NULL, count INTEGER NOT NULL,"
+            " fetched_at REAL NOT NULL, PRIMARY KEY (me, user_id))"
         )
         self._conn.commit()
 
@@ -102,7 +108,31 @@ class CacheStore:
             self._conn.execute("DELETE FROM llm_results")
             self._conn.commit()
 
+    # ---- 共同好友数缓存（按获取时间绝对过期，过期判断由调用方做） ----
+
+    def get_mutual_count(self, me, user_id):
+        """返回 (共同好友数, 获取时间)；无记录时 (None, 0.0)。读取不刷新时间。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT count, fetched_at FROM mutual_counts WHERE me = ? AND user_id = ?",
+                (me, user_id),
+            ).fetchone()
+        if not row:
+            return None, 0.0
+        return int(row[0]), row[1]
+
+    def put_mutual_count(self, me, user_id, count):
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO mutual_counts (me, user_id, count, fetched_at) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(me, user_id) DO UPDATE SET"
+                " count = excluded.count, fetched_at = excluded.fetched_at",
+                (me, user_id, int(count), time.time()),
+            )
+            self._conn.commit()
+
     def clear_profiles(self):
         with self._lock:
             self._conn.execute("DELETE FROM profiles")
+            self._conn.execute("DELETE FROM mutual_counts")
             self._conn.commit()

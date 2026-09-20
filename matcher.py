@@ -115,8 +115,9 @@ class Matcher:
         self._wakeup = threading.Event()
         self._timer = None
         self._scan_thread = None
-        self._avatar_pool = None
-        self.avatar_dir = os.path.join(os.path.dirname(os.path.abspath(config.path)), "cache", "avatars")
+        self.avatar_dir = getattr(
+            config, "avatar_dir", os.path.join(os.path.dirname(os.path.abspath(config.path)), "cache", "avatars")
+        )
 
     # ---- sink ----
 

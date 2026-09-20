@@ -112,7 +112,7 @@ def main():
         sys.exit(0 if selfcheck.run() else 1)
 
     cfg = config_mod.Config(args.config)
-    cache = CacheStore(config_mod.CACHE_PATH)
+    cache = CacheStore(cfg.cache_path)
     if args.clear_llm_cache:
         cache.clear_llm()
         print("LLM 缓存已清空")

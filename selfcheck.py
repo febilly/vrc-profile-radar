@@ -469,6 +469,31 @@ def test_config_backup():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def test_data_dir_properties():
+    print("== 数据目录与衍生路径 ==")
+    tmpdir = tempfile.mkdtemp()
+    try:
+        target = os.path.join(tmpdir, "target")
+        os.makedirs(target, exist_ok=True)
+        with open(os.path.join(target, "config.json"), "w", encoding="utf-8") as f:
+            f.write('{"rules": [{"id": "m1", "name": "测试规则"}]}')
+
+        # 验证 Config 实例仅基于指定/默认路径衍生目录，不理会其他位置
+        cfg = config_mod.Config(os.path.join(target, "config.json"))
+        check("Config.data_dir 正确指向目标目录", cfg.data_dir == target)
+        check("Config.cache_path 对齐", cfg.cache_path == os.path.join(target, "cache.db"))
+        check("Config.avatar_dir 对齐", cfg.avatar_dir == os.path.join(target, "cache", "avatars"))
+        check("Config.backup_dir 对齐", cfg.backup_dir == os.path.join(target, "backups"))
+        check("规则可正常读取", cfg.get("rules")[0]["name"] == "测试规则")
+
+        # 验证默认 DATA_DIR 位于系统标准目录且不与源码目录重合
+        default_dir = config_mod.get_default_data_dir()
+        check("默认数据目录名称为 VRCProfileRadar", os.path.basename(default_dir) == "VRCProfileRadar")
+        check("默认数据目录不在代码自身目录下", os.path.abspath(default_dir) != os.path.abspath(os.path.dirname(__file__)))
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def test_log_discovery():
     print("== 日志文件发现（新旧位置兼容） ==")
     tmpdir = tempfile.mkdtemp()
@@ -542,6 +567,7 @@ def run():
     test_cache()
     test_extract_json()
     test_config_backup()
+    test_data_dir_properties()
     test_rules_import_export()
     test_pipeline()
     test_pipeline_exclusion()

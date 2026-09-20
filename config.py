@@ -1,4 +1,4 @@
-"""配置读写。首次运行时在程序目录生成 config.json（含示例规则）。
+r"""配置读写。首次运行时在数据目录（%LOCALAPPDATA%\VRCProfileRadar）生成 config.json（含示例规则）。
 
 自带防丢保护：每次保存都会在 backups/ 里镜像一份最新配置（config-latest.json）
 和每日快照（保留 7 天）；config.json 丢失或损坏时，启动会自动从最近的备份恢复，
@@ -11,14 +11,26 @@ import threading
 import time
 import uuid
 
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(APP_DIR, "config.json")
-CACHE_PATH = os.path.join(APP_DIR, "cache.db")
-AVATAR_DIR = os.path.join(APP_DIR, "cache", "avatars")
+def get_default_data_dir():
+    local_appdata = os.environ.get("LOCALAPPDATA")
+    if local_appdata:
+        return os.path.join(local_appdata, "VRCProfileRadar")
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        return os.path.join(appdata, "VRCProfileRadar")
+    return os.path.join(os.path.expanduser("~"), ".vrc-profile-radar")
+
+
+DATA_DIR = get_default_data_dir()
+CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
+CACHE_PATH = os.path.join(DATA_DIR, "cache.db")
+AVATAR_DIR = os.path.join(DATA_DIR, "cache", "avatars")
+BACKUP_DIR = os.path.join(DATA_DIR, "backups")
 
 DEFAULT_LOG_DIR = os.path.join(
     os.environ.get("USERPROFILE", ""), "AppData", "LocalLow", "VRChat", "VRChat", "Output Log"
 )
+
 
 EXAMPLE_RULES = [
     {
@@ -94,11 +106,20 @@ DEFAULT_CONFIG = {
 class Config:
     def __init__(self, path=None):
         self.path = path or CONFIG_PATH
-        self.backup_dir = os.path.join(os.path.dirname(os.path.abspath(self.path)), "backups")
+        self.data_dir = os.path.dirname(os.path.abspath(self.path))
+        self.backup_dir = os.path.join(self.data_dir, "backups")
         self._lock = threading.RLock()
         self._save_timer = None
         self.data = {}
         self.load()
+
+    @property
+    def cache_path(self):
+        return os.path.join(self.data_dir, "cache.db")
+
+    @property
+    def avatar_dir(self):
+        return os.path.join(self.data_dir, "cache", "avatars")
 
     def load(self):
         with self._lock:

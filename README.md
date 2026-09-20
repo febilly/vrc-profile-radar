@@ -48,9 +48,9 @@ python main.py --clear-llm-cache  # 清空 LLM 结果缓存
 
 ## 配置
 
-所有配置都可以在主面板里改；也可以直接改 `config.json`（首次运行自动生成）。
+所有配置都可以在主面板里改；也可以直接改数据目录下的 `config.json`（默认位于 `%LOCALAPPDATA%\VRCProfileRadar\config.json`，首次运行自动生成）。
 
-**防丢保护**：每次保存都会自动在 `backups/` 里镜像一份最新配置（`config-latest.json`）并保留最近 7 天的每日快照。如果 `config.json` 被误删或损坏，下次启动会自动从最近的备份恢复，规则不会丢。（想彻底重置的话，把 `config.json`、`config.json.bak` 和 `backups/` 一起删掉即可。）
+**数据与防丢保护**：程序配置、API Key、本地缓存（`cache.db` 与头像）统一存放在系统用户目录 `%LOCALAPPDATA%\VRCProfileRadar\` 中，不再存放在程序自身目录下，保证代码目录整洁且敏感 Key 不被提交。每次保存都会自动在数据目录下的 `backups/` 里镜像一份最新配置（`config-latest.json`）并保留最近 7 天的每日快照。如果 `config.json` 被误删或损坏，下次启动会自动从最近的备份恢复，规则不会丢。（想彻底重置的话，把 `%LOCALAPPDATA%\VRCProfileRadar\` 文件夹删掉即可。）
 
 ### 1. Cookie
 

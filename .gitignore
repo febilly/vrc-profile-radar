@@ -19,3 +19,23 @@ shot_*.png
 ui_*.png
 *.log
 *.tmp
+
+# ---- 插件开发目录（整体排除） ----
+plugins_dev/
+
+# ---- 环境变量与密钥 ----
+.env
+.env.*
+
+# ---- 编辑器与 IDE 配置 ----
+.vscode/
+.idea/
+
+# ---- 操作系统产物 ----
+Thumbs.db
+.DS_Store
+
+# ---- 规则导出文件 ----
+*.rules.json
+rules_export_*.json
+

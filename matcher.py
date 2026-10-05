@@ -11,12 +11,15 @@ import os
 import re
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
 import rules as rules_mod
-from rules import Rule, KEYWORD, REGEX, LLM, EXCLUDE, MUTUAL, compare_count
+from rules import (
+    Rule, KEYWORD, REGEX, LLM, EXCLUDE, MUTUAL, compare_count, format_rule_display_name
+)
+from plugin_manager import PluginManager, PluginUserInfo
 from llm_matcher import LLMMatcher, LLMNotConfigured
 from vrchat_api import VRChatAPIError
 
@@ -96,6 +99,7 @@ class Matcher:
         self._failed_uids = set()   # 最近一次扫描里获取失败的玩家
         self._scanning = False
         self._fetching_uid = None
+        self._fetching_uids = set()
         self.last_scan_time = 0.0
         self._local_uid = ""
         self._local_name = ""
@@ -115,9 +119,12 @@ class Matcher:
         self._wakeup = threading.Event()
         self._timer = None
         self._scan_thread = None
+        self._avatar_pool = None
+        self._scan_pool = None
         self.avatar_dir = getattr(
             config, "avatar_dir", os.path.join(os.path.dirname(os.path.abspath(config.path)), "cache", "avatars")
         )
+        self.plugin_manager = PluginManager(config, cache=cache, api=api, matcher=self)
 
     # ---- sink ----
 
@@ -146,19 +153,32 @@ class Matcher:
 
     # ---- 生命周期 ----
 
+    def _get_scan_pool(self):
+        with self._lock:
+            if self._scan_pool is None or getattr(self._scan_pool, "_shutdown", False):
+                self._scan_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="ScanWorker")
+            return self._scan_pool
+
     def start(self):
         self._scan_thread = threading.Thread(target=self._scan_loop, daemon=True, name="Scanner")
         self._scan_thread.start()
         self._avatar_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="Avatar")
+        self._scan_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="ScanWorker")
         self._status("监控中，等待进入实例…")
 
     def stop(self):
         self._stop.set()
         self._wakeup.set()
+        if hasattr(self, "_avatar_pool") and self._avatar_pool:
+            self._avatar_pool.shutdown(wait=False)
+        if hasattr(self, "_scan_pool") and self._scan_pool:
+            self._scan_pool.shutdown(wait=False)
 
     def reload_settings(self):
         self.debounce = float(self.config.get("scan", "debounce_seconds", default=3.0) or 3.0)
         self.profile_cache_hours = float(self.config.get("api", "profile_cache_hours", default=4) or 4)
+        if hasattr(self, "plugin_manager"):
+            self.plugin_manager.reload()
 
     def set_api(self, api):
         """替换 API 客户端（设置里换了 Cookie 后调用）：好友/身份缓存一并失效。"""
@@ -166,6 +186,8 @@ class Matcher:
         self._me_uid = ""
         self._friends = {}
         self._friends_at = 0.0
+        if hasattr(self, "plugin_manager"):
+            self.plugin_manager.api = api
 
     # ---- 日志事件入口 ----
 
@@ -219,6 +241,17 @@ class Matcher:
             self._timer.daemon = True
             self._timer.start()
 
+    def rescan(self, immediate=True):
+        """重新对当前实例内的玩家运行匹配流水线（规则修改或配置更新后调用）。"""
+        with self._lock:
+            if self._timer:
+                self._timer.cancel()
+                self._timer = None
+            if self._scan_thread and self._scan_thread.is_alive():
+                self._wakeup.set()
+            else:
+                self.run_scan()
+
     # ---- 扫描 ----
 
     def _scan_loop(self):
@@ -236,9 +269,14 @@ class Matcher:
         with self._lock:
             snapshot = list(self._players.values())
         if not snapshot:
+            with self._lock:
+                if self._matches:
+                    self._matches.clear()
+                    self._emit_matches()
             return
 
-        if self.api is None or not self.api.configured:
+        has_api = self.api is not None and self.api.configured
+        if not has_api and not self._profiles:
             self._cookie_error = True
             self._status("未配置 VRChat Cookie，无法获取资料（设置里填 auth cookie）", level="warn")
             return
@@ -249,41 +287,130 @@ class Matcher:
         try:
             self._ensure_friends()
             excluded = self._compute_excluded()
+            active_uids = {p.get("user_id") for p in snapshot if p.get("user_id")}
+            enabled_rules_map = {r.id: r for r in self._enabled_rules()}
             with self._lock:
-                for uid in excluded:
-                    self._matches.pop(uid, None)
-                    self._profiles.pop(uid, None)
+                for uid in list(self._matches.keys()):
+                    if uid not in active_uids or uid in excluded:
+                        del self._matches[uid]
+                    else:
+                        entry = self._matches[uid]
+                        new_rules = []
+                        for r in entry.get("rules", []):
+                            rid = r.get("id")
+                            if r.get("type") == "plugin":
+                                new_rules.append(r)
+                            elif rid in enabled_rules_map:
+                                er = enabled_rules_map[rid]
+                                r["name"] = er.name
+                                r["color"] = er.color
+                                new_rules.append(r)
+                        if new_rules:
+                            entry["rules"] = new_rules
+                        else:
+                            del self._matches[uid]
             self._refresh_exclude_names(snapshot)
-            fetched, failed, skipped = 0, 0, 0
+
+            # ---- 阶段 1：优先利用已有信息（内存缓存/本地SQLite缓存/已知昵称）立即进行初筛匹配并推送 ----
+            mutual_rules = self._enabled_rules(MUTUAL)
+            me = self._get_me_uid() if mutual_rules else ""
+
+            for player in snapshot:
+                uid = player.get("user_id")
+                if not uid or uid in excluded:
+                    continue
+                # 先看是否已有缓存资料
+                cached_profile = None
+                with self._lock:
+                    if uid in self._profiles:
+                        cached_profile = self._profiles[uid]
+                if not cached_profile:
+                    cached_data, fetched_at = self.cache.get_profile(uid)
+                    if cached_data and time.time() - fetched_at < self.profile_cache_hours * 3600:
+                        cached_profile = cached_data
+                        with self._lock:
+                            self._profiles[uid] = cached_profile
+
+                if cached_profile:
+                    self._apply_local_rules(uid, cached_profile)
+                    self._apply_plugin_rules(uid, cached_profile)
+                elif player.get("name"):
+                    # 尚未拉取到完整资料时，先用已知的名字与用户基础信息匹配
+                    temp_profile = {"displayName": player["name"], "bio": "", "bioLinks": []}
+                    self._apply_local_rules(uid, temp_profile)
+                    self._apply_plugin_rules(uid, temp_profile)
+
+                if mutual_rules and me:
+                    self._apply_mutual_rules_for_player(player, excluded, mutual_rules, me, cached_only=True)
+
+            # 初筛完成后立刻通知悬浮窗刷新（零等待，缓存数据毫秒级展示）
+            self._emit_matches()
+            self._request_avatars()
+
+            # ---- 阶段 2：并发拉取最新资料并实时匹配更新（受 api._throttle 严格控速，消除单连接网络延迟阻塞） ----
+            valid_targets = [p for p in snapshot if p.get("user_id") and p["user_id"] not in excluded]
+            skipped = len(snapshot) - len(valid_targets)
+            total_targets = len(valid_targets)
+
+            fetched, failed = 0, 0
             with self._lock:
                 self._failed_uids = set()
-            for i, player in enumerate(snapshot):
-                if self._stop.is_set():
-                    return
-                uid = player["user_id"]
-                if not uid:
-                    continue  # 旧版日志无 usr id，无法查询
-                if uid in excluded:
-                    skipped += 1
-                    continue
-                self._fetching_uid = uid
-                profile = self._get_profile(uid)
-                self._fetching_uid = None
-                if profile is None:
-                    failed += 1
-                    with self._lock:
-                        self._failed_uids.add(uid)
-                else:
-                    with self._lock:
-                        self._profiles[uid] = profile
-                    self._apply_local_rules(uid, profile)
-                    self._emit_matches()
-                fetched += 1
-                if fetched % 5 == 0 or i == len(snapshot) - 1:
-                    self._status("拉取资料中… %d/%d" % (i + 1, len(snapshot)))
 
+            if valid_targets:
+                def _fetch_worker(player):
+                    if self._stop.is_set():
+                        return None, False
+                    uid = player["user_id"]
+                    with self._lock:
+                        self._fetching_uids.add(uid)
+                    success = False
+                    try:
+                        profile = self._get_profile(uid)
+                        if self._stop.is_set():
+                            return uid, False
+
+                        if profile is None:
+                            with self._lock:
+                                self._failed_uids.add(uid)
+                        else:
+                            with self._lock:
+                                self._profiles[uid] = profile
+                            self._apply_local_rules(uid, profile)
+                            self._apply_plugin_rules(uid, profile)
+                            success = True
+
+                        if mutual_rules and me and not self._stop.is_set():
+                            self._apply_mutual_rules_for_player(player, excluded, mutual_rules, me, cached_only=False)
+
+                        return uid, success
+                    finally:
+                        with self._lock:
+                            self._fetching_uids.discard(uid)
+
+                pool = self._get_scan_pool()
+                futures = [pool.submit(_fetch_worker, p) for p in valid_targets]
+                for fut in as_completed(futures):
+                    if self._stop.is_set():
+                        break
+                    try:
+                        uid, succ = fut.result()
+                        if succ:
+                            fetched += 1
+                        else:
+                            failed += 1
+                    except Exception:
+                        failed += 1
+
+                    total_done = fetched + failed
+                    if total_done % 5 == 0 or total_done == total_targets:
+                        self._status("拉取资料中… %d/%d" % (total_done, total_targets))
+
+                    # 关键：每拉取并匹配完一位玩家，立即推送更新到界面，无需等待全部玩家完成
+                    self._emit_matches()
+                    self._request_avatars()
+
+            # ---- 阶段 3：LLM 大模型规则批量计算 ----
             self._run_llm_rules()
-            self._run_mutual_rules(snapshot, excluded)
             with self._lock:
                 count = len(self._matches)
             level = "warn" if failed else "info"
@@ -295,13 +422,20 @@ class Matcher:
         finally:
             self._scanning = False
             self._fetching_uid = None
+            with self._lock:
+                self._fetching_uids.clear()
             self.last_scan_time = time.time()
 
     def _get_profile(self, uid):
+        with self._lock:
+            if uid in self._profiles:
+                return self._profiles[uid]
         cached, fetched_at = self.cache.get_profile(uid)
         now = time.time()
         if cached and now - fetched_at < self.profile_cache_hours * 3600:
             return cached  # 简介缓存按时间过期（默认 4 小时），期内直接复用
+        if not self.api or not self.api.configured:
+            return cached
         try:
             full = self.api.get_profile(uid)
         except VRChatAPIError as exc:
@@ -319,6 +453,11 @@ class Matcher:
         """跑所有本地规则并更新该用户的匹配结果。"""
         with self._lock:
             entry = self._matches.get(uid) or self._new_entry(uid, profile)
+            if profile and (not entry.get("profile", {}).get("avatar") or profile.get("avatar")):
+                entry["profile"] = profile
+            if profile.get("displayName"):
+                entry["name"] = profile["displayName"]
+            old_rules = list(entry.get("rules", []))
         hit_rules = []
         for rule in self._enabled_rules(KEYWORD, REGEX):
             hits = rules_mod.match_local(rule, profile)
@@ -326,8 +465,35 @@ class Matcher:
                 hit_rules.append({
                     "id": rule.id, "name": rule.name, "type": rule.type,
                     "reason": "、".join(hits[:5]), "color": rule.color,
+                    "action": {"type": "detail"},
                 })
-        self._update_entry(uid, entry, hit_rules)
+        enabled_rules_map = {r.id: r for r in self._enabled_rules()}
+        preserved = []
+        for r in old_rules:
+            if r.get("type") not in (KEYWORD, REGEX):
+                rid = r.get("id")
+                if r.get("type") == "plugin" or r.get("plugin_id") or rid in enabled_rules_map:
+                    if rid in enabled_rules_map:
+                        er = enabled_rules_map[rid]
+                        r["name"] = er.name
+                        r["color"] = er.color
+                    preserved.append(r)
+        self._update_entry(uid, entry, hit_rules + preserved)
+
+    def _apply_plugin_rules(self, uid, profile):
+        """跑用户添加并启用的插件规则并更新该用户的匹配结果。"""
+        if not hasattr(self, "plugin_manager"):
+            return
+        uinfo = PluginUserInfo.from_profile(uid, profile, context=self.plugin_manager)
+        plugin_hits = self.plugin_manager.match_external_plugins(uinfo, enabled_rules=self._enabled_rules())
+        with self._lock:
+            entry = self._matches.get(uid) or self._new_entry(uid, profile)
+            if profile and (not entry.get("profile", {}).get("avatar") or profile.get("avatar")):
+                entry["profile"] = profile
+            if profile.get("displayName"):
+                entry["name"] = profile["displayName"]
+            other_rules = [r for r in entry.get("rules", []) if r.get("type") in (KEYWORD, REGEX, MUTUAL, LLM, EXCLUDE)]
+            self._update_entry(uid, entry, other_rules + plugin_hits)
 
     def _run_llm_rules(self):
         llm_rules = self._enabled_rules(LLM)
@@ -375,6 +541,7 @@ class Matcher:
                     hit_rules.append({
                         "id": rule.id, "name": rule.name, "type": LLM,
                         "reason": res.get("reason", ""), "color": rule.color,
+                        "action": {"type": "detail"},
                     })
                 self._update_entry(uid, entry, hit_rules)
             self._emit_matches()
@@ -444,6 +611,79 @@ class Matcher:
 
     # ---- 共同好友规则 ----
 
+    def _apply_mutual_rules_for_player(self, player, excluded, mutual_rules=None, me=None, cached_only=False):
+        """对单个玩家评估共同好友规则。cached_only=True 时仅读缓存不发起网络请求。"""
+        if mutual_rules is None:
+            mutual_rules = self._enabled_rules(MUTUAL)
+        if not mutual_rules:
+            return
+        if not me:
+            me = self._get_me_uid()
+        if not me:
+            return
+        uid = player.get("user_id")
+        if not uid or uid in excluded:
+            return
+
+        with self._lock:
+            profile = self._profiles.get(uid) or {}
+            entry = self._matches.get(uid) or self._new_entry(uid, profile)
+            if not entry.get("name"):
+                entry["name"] = player.get("name", "")
+            existing_rules = list(entry.get("rules", []))
+
+        other_rules = [r for r in existing_rules if r.get("type") != MUTUAL]
+        existing_mutual_map = {r.get("id"): r for r in existing_rules if r.get("type") == MUTUAL}
+
+        new_mutual_rules = {}
+        for rule in mutual_rules:
+            limit_users = getattr(rule, "limit_users", False)
+            target_uids = {u["user_id"] for u in (rule.users or []) if u.get("user_id")} if limit_users else None
+            if limit_users:
+                if cached_only:
+                    friends, fetched_at = self.cache.get_mutual_friends(me, uid)
+                    if friends is None or time.time() - fetched_at >= MUTUAL_TTL:
+                        if rule.id in existing_mutual_map:
+                            new_mutual_rules[rule.id] = existing_mutual_map[rule.id]
+                        continue
+                else:
+                    friends = self._get_mutual_friends_list(me, uid)
+                if friends is None:
+                    if rule.id in existing_mutual_map:
+                        new_mutual_rules[rule.id] = existing_mutual_map[rule.id]
+                    continue
+                matched_count = sum(1 for f in friends if (f.get("id") or f.get("userId")) in target_uids)
+                hit = compare_count(rule.operator, matched_count, rule.count)
+                actual_count = matched_count
+                reason = "指定共同好友 %d 人" % matched_count
+            else:
+                if cached_only:
+                    count, fetched_at = self.cache.get_mutual_count(me, uid)
+                    if count is None or time.time() - fetched_at >= MUTUAL_TTL:
+                        if rule.id in existing_mutual_map:
+                            new_mutual_rules[rule.id] = existing_mutual_map[rule.id]
+                        continue
+                else:
+                    count = self._get_mutual_count(me, uid)
+                if count is None:
+                    if rule.id in existing_mutual_map:
+                        new_mutual_rules[rule.id] = existing_mutual_map[rule.id]
+                    continue
+                hit = compare_count(rule.operator, count, rule.count)
+                actual_count = count
+                reason = "共同好友 %d 人" % count
+
+            if hit:
+                display_name = format_rule_display_name(rule.name, actual_count)
+                new_mutual_rules[rule.id] = {
+                    "id": rule.id, "name": display_name, "raw_name": rule.name, "type": MUTUAL,
+                    "reason": reason, "color": rule.color,
+                    "action": {"type": "detail"},
+                }
+
+        final_rules = other_rules + list(new_mutual_rules.values())
+        self._update_entry(uid, entry, final_rules)
+
     def _run_mutual_rules(self, snapshot, excluded):
         rules = self._enabled_rules(MUTUAL)
         if not rules:
@@ -458,31 +698,16 @@ class Matcher:
 
         for rule in rules:
             self._status("共同好友规则「%s」计算中…" % rule.name)
-            for player in targets:
-                uid = player["user_id"]
-                count = self._get_mutual_count(me, uid)
-                if count is None:
-                    continue  # 获取失败且无缓存：跳过，不动已有匹配
-                hit = compare_count(rule.operator, count, rule.count)
-                reason = "共同好友 %d 人" % count
-                with self._lock:
-                    profile = self._profiles.get(uid) or {}
-                    entry = self._matches.get(uid) or self._new_entry(uid, profile)
-                    if not entry.get("name"):
-                        entry["name"] = player.get("name", "")
-                hit_rules = [r for r in entry["rules"] if r["id"] != rule.id]
-                if hit:
-                    hit_rules.append({
-                        "id": rule.id, "name": rule.name, "type": MUTUAL,
-                        "reason": reason, "color": rule.color,
-                    })
-                self._update_entry(uid, entry, hit_rules)
-            self._emit_matches()
+        for player in targets:
+            self._apply_mutual_rules_for_player(player, excluded, rules, me, cached_only=False)
+        self._emit_matches()
 
     def _get_me_uid(self):
         """Cookie 账号的用户 id（共同好友数以它为基准），进程内缓存。"""
         if self._me_uid:
             return self._me_uid
+        if not self.api or not self.api.configured:
+            return ""
         try:
             me = self.api.get_me()
         except VRChatAPIError as exc:
@@ -512,6 +737,23 @@ class Matcher:
         self.cache.put_mutual_count(me, uid, count)
         return count
 
+    def _get_mutual_friends_list(self, me, uid):
+        """获取公开可见共同好友列表：先查缓存（24h 过期），未命中调 API。失败时退回旧缓存。"""
+        cached, fetched_at = self.cache.get_mutual_friends(me, uid)
+        if cached is not None and time.time() - fetched_at < MUTUAL_TTL:
+            return cached
+        try:
+            data = self.api.get_mutual_friends(uid)
+        except VRChatAPIError as exc:
+            if exc.status == 401:
+                raise
+            self._status("获取共同好友列表失败: %s" % exc, level="warn")
+            return cached
+        if not isinstance(data, list):
+            return cached
+        self.cache.put_mutual_friends(me, uid, data)
+        return data
+
     # ---- 状态表（主界面"状态"页用） ----
 
     def get_roster(self):
@@ -537,7 +779,7 @@ class Matcher:
                     entry["status"] = "获取失败"
                 elif uid in self._profiles:
                     entry["status"] = "已检测"
-                elif self._scanning and self._fetching_uid == uid:
+                elif self._scanning and (uid in self._fetching_uids or self._fetching_uid == uid):
                     entry["status"] = "检测中"
                 profile = self._profiles.get(uid) or {}
                 entry["bio"] = re.sub(r"\s+", " ", profile.get("bio") or "").strip()
@@ -611,9 +853,19 @@ class Matcher:
             except OSError:
                 data = None
         if not data:
+            headers = {}
+            if self.api and hasattr(self.api, "_headers"):
+                headers["User-Agent"] = self.api._headers.get("User-Agent") or "profile-check/1.0"
+            else:
+                headers["User-Agent"] = "profile-check/1.0 (personal VRChat profile matcher; contact: local-user)"
+            cookies = {}
+            if self.api and getattr(self.api, "auth_cookie", None):
+                cookies["auth"] = self.api.auth_cookie
+                if getattr(self.api, "two_factor_cookie", None):
+                    cookies["twoFactorAuth"] = self.api.two_factor_cookie
             try:
-                resp = requests.get(url, timeout=15)
-                if resp.status_code == 200:
+                resp = requests.get(url, headers=headers, cookies=cookies, timeout=15)
+                if resp.status_code == 200 and resp.content:
                     data = resp.content
                     with open(path, "wb") as f:
                         f.write(data)

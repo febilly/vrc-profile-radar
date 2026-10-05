@@ -147,13 +147,26 @@ class UserSearchDialog(tk.Toplevel):
 
     def _render(self, users):
         self._clear_rows()
+        def _set_row_bg(r, col):
+            r.config(bg=col)
+            for ch in r.winfo_children():
+                try:
+                    if isinstance(ch, tk.Frame):
+                        ch.config(bg=col)
+                        for sub in ch.winfo_children():
+                            sub.config(bg=col)
+                    elif not ch.cget("image"):
+                        ch.config(bg=col)
+                except tk.TclError:
+                    pass
+
         for idx, user in enumerate(users[:MAX_RESULTS]):
             name = user.get("displayName") or "(未知)"
             trust_name, trust_color, _ = _trust_of(user)
 
             row = tk.Frame(self.inner, bg=BG)
             row.pack(fill="x", padx=2, pady=3)
-            avatar = tk.Label(row, bg="#e8e8e8", fg=FG_DIM, text="·", font=(theme.FONT, 9))
+            avatar = tk.Label(row, bg=theme.BG_CARD, fg=FG_DIM, text="·", font=(theme.FONT, 9))
             if not _avatar_url(user):
                 avatar.config(text="👤", font=("Segoe UI Emoji", 12))
             avatar.pack(side="left", padx=(0, 8))
@@ -169,8 +182,8 @@ class UserSearchDialog(tk.Toplevel):
             widgets = [row] + row.winfo_children() + info.winfo_children()
             for w in widgets:
                 w.bind("<Button-1>", lambda e, u=user: self._pick(u))
-                w.bind("<Enter>", lambda e, r=row: r.config(bg=theme.BG_HOVER))
-                w.bind("<Leave>", lambda e, r=row: r.config(bg=BG))
+                w.bind("<Enter>", lambda e, r=row: _set_row_bg(r, theme.BG_HOVER))
+                w.bind("<Leave>", lambda e, r=row: _set_row_bg(r, BG))
                 w.config(cursor="hand2")
                 for child in (w.winfo_children() if isinstance(w, tk.Frame) else []):
                     try:

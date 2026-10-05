@@ -34,6 +34,16 @@ def compare_count(operator_str, count, threshold):
         return False
 
 
+def format_rule_display_name(name_template, count):
+    """将规则名称模板中的占位符（{count}, {n} 等）替换为实际数字。"""
+    if not name_template:
+        return ""
+    text = str(name_template)
+    for ph in ("{count}", "{Count}", "{COUNT}", "{n}", "{N}"):
+        text = text.replace(ph, str(count))
+    return text
+
+
 def _valid_color(value):
     """只接受 #rrggbb 形式的颜色，其他一律清空（回退自动取色）。"""
     m = re.fullmatch(r"#([0-9a-fA-F]{6})", str(value or "").strip())
@@ -59,6 +69,14 @@ class Rule:
     # mutual_friends 类型：与 Cookie 账号的共同好友数满足比较条件
     operator: str = ">="
     count: int = 5
+    limit_users: bool = False                  # 是否仅从指定名单(users)中筛选共同好友
+    extra: dict = field(default_factory=dict)  # 插件规则等自定义配置
+
+    def get(self, key, default=None):
+        if hasattr(self, key):
+            val = getattr(self, key)
+            return val if val is not None else default
+        return self.extra.get(key, default)
 
     @classmethod
     def from_dict(cls, data):
@@ -73,6 +91,14 @@ class Rule:
         op = str(data.get("operator", ">="))
         if op not in OPERATORS:
             op = ">="
+
+        known_keys = {
+            "id", "name", "type", "keywords", "mode", "pattern", "fields",
+            "prompt", "color", "enabled", "exclude_self", "exclude_friends",
+            "users", "operator", "count", "limit_users",
+        }
+        extra = {k: v for k, v in data.items() if k not in known_keys}
+
         rule = cls(
             id=str(data.get("id") or ""),
             name=str(data.get("name") or "未命名规则"),
@@ -89,6 +115,8 @@ class Rule:
             users=users,
             operator=op,
             count=count,
+            limit_users=bool(data.get("limit_users", False)),
+            extra=extra,
         )
         if not rule.id:
             rule.id = "rule-" + hashlib.md5(
@@ -99,14 +127,18 @@ class Rule:
         return rule
 
     def to_dict(self):
-        return {
+        d = {
             "id": self.id, "name": self.name, "type": self.type,
             "keywords": self.keywords, "mode": self.mode, "pattern": self.pattern,
             "fields": self.fields, "prompt": self.prompt, "color": self.color,
             "enabled": self.enabled,
             "exclude_self": self.exclude_self, "exclude_friends": self.exclude_friends,
             "users": self.users, "operator": self.operator, "count": self.count,
+            "limit_users": self.limit_users,
         }
+        if self.extra:
+            d.update(self.extra)
+        return d
 
 
 def rule_hash(rule):
@@ -117,7 +149,9 @@ def rule_hash(rule):
         payload = {"type": KEYWORD, "keywords": sorted(rule.keywords), "mode": rule.mode,
                    "fields": sorted(rule.fields)}
     elif rule.type == MUTUAL:
-        payload = {"type": MUTUAL, "operator": rule.operator, "count": rule.count}
+        payload = {"type": MUTUAL, "operator": rule.operator, "count": rule.count,
+                   "limit_users": rule.limit_users,
+                   "users": sorted(u.get("user_id", "") for u in rule.users)}
     else:
         payload = {"type": REGEX, "pattern": rule.pattern, "fields": sorted(rule.fields)}
     return hashlib.sha256(
@@ -189,6 +223,7 @@ def rule_signature(rule):
         "exclude_self": rule.exclude_self, "exclude_friends": rule.exclude_friends,
         "users": sorted(u.get("user_id", "") for u in rule.users),
         "operator": rule.operator, "count": rule.count,
+        "limit_users": getattr(rule, "limit_users", False),
     }, ensure_ascii=False, sort_keys=True)
 
 

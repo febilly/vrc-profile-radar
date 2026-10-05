@@ -276,3 +276,18 @@ class VRChatAPI:
     def get_mutual_counts(self, user_id):
         """与某玩家的共同项计数：{"friendCount": N, "groupCount": M}（隐藏的共同好友也计入）。"""
         return self._request("/users/%s/mutuals" % user_id)
+
+    def get_mutual_friends(self, user_id):
+        """获取与某玩家公开可见的共同好友列表：[{"id": "usr_xxx", "displayName": "..."}, ...]（支持分页拉取）。"""
+        out = []
+        offset = 0
+        page = 100
+        while offset <= 1000:  # 上限保护
+            batch = self._request("/users/%s/mutuals/friends?offset=%d&n=%d" % (user_id, offset, page))
+            if not isinstance(batch, list):
+                break
+            out.extend(batch)
+            if len(batch) < page:
+                break
+            offset += page
+        return out

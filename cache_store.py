@@ -29,6 +29,11 @@ class CacheStore:
             " me TEXT NOT NULL, user_id TEXT NOT NULL, count INTEGER NOT NULL,"
             " fetched_at REAL NOT NULL, PRIMARY KEY (me, user_id))"
         )
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS mutual_friends ("
+            " me TEXT NOT NULL, user_id TEXT NOT NULL, friends TEXT NOT NULL,"
+            " fetched_at REAL NOT NULL, PRIMARY KEY (me, user_id))"
+        )
         self._conn.commit()
 
     # ---- 玩家简介缓存（按时间过期，过期判断由调用方按 fetched_at 做） ----
@@ -131,8 +136,33 @@ class CacheStore:
             )
             self._conn.commit()
 
+    def get_mutual_friends(self, me, user_id):
+        """返回 (共同好友列表, 获取时间)；无记录时 (None, 0.0)。读取不刷新时间。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT friends, fetched_at FROM mutual_friends WHERE me = ? AND user_id = ?",
+                (me, user_id),
+            ).fetchone()
+        if not row:
+            return None, 0.0
+        try:
+            return json.loads(row[0]), row[1]
+        except (ValueError, TypeError):
+            return None, 0.0
+
+    def put_mutual_friends(self, me, user_id, friends):
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO mutual_friends (me, user_id, friends, fetched_at) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(me, user_id) DO UPDATE SET"
+                " friends = excluded.friends, fetched_at = excluded.fetched_at",
+                (me, user_id, json.dumps(friends, ensure_ascii=False), time.time()),
+            )
+            self._conn.commit()
+
     def clear_profiles(self):
         with self._lock:
             self._conn.execute("DELETE FROM profiles")
             self._conn.execute("DELETE FROM mutual_counts")
+            self._conn.execute("DELETE FROM mutual_friends")
             self._conn.commit()

@@ -92,9 +92,10 @@ class MainWindow:
         self.matcher = matcher
         self.apply_hooks = list(apply_hooks)
         self.on_quit = on_quit
+        self.overlay = overlay
 
         self.top = tk.Toplevel(root)
-        self.top.title("VRChat Profile 匹配器" + ("（演示模式）" if getattr(root, "_demo", False) else ""))
+        self.top.title("VRChat Profile 雷达" + ("（演示模式）" if getattr(root, "_demo", False) else ""))
         w = int(config.get("ui", "main_w", default=760) * theme.SCALE)
         h = int(config.get("ui", "main_h", default=600) * theme.SCALE)
         w = min(w, int(self.top.winfo_screenwidth() * 0.9))

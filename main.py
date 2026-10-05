@@ -1,4 +1,4 @@
-"""VRChat Profile 匹配器 —— 入口。
+"""VRChat Profile 雷达 —— 入口。
 
 用法:
   python main.py                  # 悬浮窗 + 主面板
@@ -97,7 +97,7 @@ def run_gui(cfg, cache, matcher, demo):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="VRChat Profile 匹配器")
+    parser = argparse.ArgumentParser(description="VRChat Profile 雷达")
     parser.add_argument("--demo", action="store_true", help="演示模式（假数据）")
     parser.add_argument("--console", action="store_true", help="无界面控制台模式")
     parser.add_argument("--check", action="store_true", help="运行自检测试")

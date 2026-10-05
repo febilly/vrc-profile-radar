@@ -72,15 +72,28 @@ CANNED_PROFILES = [
     },
 ]
 
+EXTRA_PLUGIN_PROFILES = [
+    {
+        "id": "usr_88888888-1111-2222-3333-444444444444",
+        "displayName": "PluginDemoUser",
+        "bio": "插件演示用户，包含示例外部链接",
+        "bioLinks": ["https://example.com/?r=demo_code_12345"],
+        "pronouns": "",
+        "tags": [],
+        "currentAvatarThumbnailImageUrl": "",
+    },
+]
+
 
 class FakeAPI:
     """代替 VRChatAPI：内存里返回假资料，模拟少量延迟。"""
 
     configured = True
 
-    def __init__(self, latency=0.15):
+    def __init__(self, latency=0.15, extra_profiles=None):
         self.latency = latency
-        self.by_id = {p["id"]: p for p in CANNED_PROFILES}
+        all_profiles = list(CANNED_PROFILES) + list(extra_profiles or [])
+        self.by_id = {p["id"]: p for p in all_profiles}
 
     def get_me(self):
         return {"displayName": "DemoLocalUser", "id": LOCAL_UID}
@@ -93,6 +106,14 @@ class FakeAPI:
         """假共同好友计数（响应形状与真实 API 一致）：Charlie 10 个，其他人 2 个。"""
         return {"friends": 10 if user_id == "usr_eeeeeeee-1111-2222-3333-444444444444" else 2,
                 "groups": 0}
+
+    def get_mutual_friends(self, user_id):
+        """假共同好友列表：Charlie 有 Alice 和 Bob 作为共同好友，其他人只有 Alice。"""
+        alice = {"id": "usr_cccccccc-1111-2222-3333-444444444444", "displayName": "Alice"}
+        bob = {"id": "usr_dddddddd-1111-2222-3333-444444444444", "displayName": "Bob"}
+        if user_id == "usr_eeeeeeee-1111-2222-3333-444444444444":
+            return [alice, bob]
+        return [alice]
 
     def get_profile(self, user_id):
         time.sleep(self.latency)
@@ -123,12 +144,17 @@ class FakeLLM(LLMMatcher):
         return results
 
 
-def setup(matcher, config, console=False):
+def setup(matcher, config, console=False, include_plugin_demo=False):
     """把 matcher 换成假数据源并开始播事件脚本。"""
-    matcher.api = FakeAPI()
+    extra = EXTRA_PLUGIN_PROFILES if include_plugin_demo else None
+    matcher.api = FakeAPI(extra_profiles=extra)
     matcher.llm = FakeLLM(config, matcher.cache)
     matcher.debounce = 1.0
     matcher._local_uid = LOCAL_UID
+
+    profiles_to_play = list(CANNED_PROFILES)
+    if include_plugin_demo:
+        profiles_to_play.extend(EXTRA_PLUGIN_PROFILES)
 
     def script():
         time.sleep(0.3)
@@ -138,7 +164,7 @@ def setup(matcher, config, console=False):
         })
         matcher.handle_log_event({"kind": "world_name", "name": "The Great Pug (演示)", "time": "demo"})
         matcher.handle_log_event({"kind": "local", "name": "DemoLocalUser", "user_id": LOCAL_UID, "time": "demo"})
-        for profile in CANNED_PROFILES:
+        for profile in profiles_to_play:
             if profile["id"] == LOCAL_UID:
                 continue
             time.sleep(0.4)
@@ -159,4 +185,4 @@ def setup(matcher, config, console=False):
 
     threading.Thread(target=script, daemon=True, name="DemoScript").start()
     if console:
-        print("演示模式：脚本将模拟 进房 → 7人加入 → 1人再次加入 → 1人离开")
+        print("演示模式：脚本将模拟 进房 → %d人加入 → 1人再次加入 → 1人离开" % len(profiles_to_play))

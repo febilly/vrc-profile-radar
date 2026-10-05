@@ -124,7 +124,7 @@ def main():
 
     if args.demo:
         import demo
-        demo.setup(matcher, cfg, console=args.console)
+        demo.setup(matcher, cfg, console=args.console, include_plugin_demo=True)
     else:
         # log_dir 留空 = 自动搜索新版/旧版两个日志位置
         log_dir = args.log_dir or cfg.get("log_dir", default="") or None

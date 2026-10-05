@@ -112,6 +112,54 @@ def add_tooltip(widget, text):
 
 
 def apply_dark_style(root):
+    # Tk 原生控件全局后备样式（确保 Combobox 弹出列表、Listbox、Text、Menu 等在 Windows 下不回退到默认白色）
+    for pattern, value in [
+        ("*ComboboxPopdown.background", BG),
+        ("*TCombobox*Listbox.background", BG_INPUT),
+        ("*TCombobox*Listbox.foreground", FG),
+        ("*TCombobox*Listbox.selectBackground", "#34435c"),
+        ("*TCombobox*Listbox.selectForeground", FG),
+        ("*TCombobox*Listbox.relief", "flat"),
+        ("*TCombobox*Listbox.borderWidth", 0),
+        ("*TCombobox*Listbox.highlightThickness", 1),
+        ("*TCombobox*Listbox.highlightBackground", BORDER),
+        ("*TCombobox*Listbox.highlightColor", BORDER),
+        ("*TCombobox*Listbox.font", (FONT, 9)),
+        ("*ComboboxListbox.background", BG_INPUT),
+        ("*ComboboxListbox.foreground", FG),
+        ("*ComboboxListbox.selectBackground", "#34435c"),
+        ("*ComboboxListbox.selectForeground", FG),
+        ("*ComboboxListbox.relief", "flat"),
+        ("*ComboboxListbox.borderWidth", 0),
+        ("*ComboboxListbox.highlightThickness", 1),
+        ("*ComboboxListbox.highlightBackground", BORDER),
+        ("*ComboboxListbox.highlightColor", BORDER),
+        ("*ComboboxListbox.font", (FONT, 9)),
+        ("*Listbox.background", BG_INPUT),
+        ("*Listbox.foreground", FG),
+        ("*Listbox.selectBackground", "#34435c"),
+        ("*Listbox.selectForeground", FG),
+        ("*Listbox.relief", "flat"),
+        ("*Listbox.highlightBackground", BORDER),
+        ("*Listbox.highlightColor", BORDER),
+        ("*Text.background", BG_INPUT),
+        ("*Text.foreground", FG),
+        ("*Text.insertBackground", FG),
+        ("*Text.selectBackground", "#34435c"),
+        ("*Text.selectForeground", FG),
+        ("*Entry.background", BG_INPUT),
+        ("*Entry.foreground", FG),
+        ("*Entry.insertBackground", FG),
+        ("*Entry.selectBackground", "#34435c"),
+        ("*Entry.selectForeground", FG),
+        ("*Menu.background", "#0f1011"),
+        ("*Menu.foreground", FG),
+        ("*Menu.activeBackground", BG_HOVER),
+        ("*Menu.activeForeground", FG),
+        ("*Toplevel.background", BG),
+    ]:
+        root.option_add(pattern, value)
+
     style = ttk.Style(root)
     try:
         style.theme_use("clam")
@@ -144,6 +192,50 @@ def apply_dark_style(root):
     style.map("TEntry", bordercolor=[("focus", ACCENT)], lightcolor=[("focus", ACCENT)])
     style.configure("TText", background=BG_INPUT, foreground=FG)
 
+    # 下拉选择框（深色背景、暗色输入底色、只读状态与弹出列表完全适配）
+    style.configure("TCombobox",
+                    fieldbackground=BG_INPUT,
+                    background=BG_CARD,
+                    foreground=FG,
+                    arrowcolor=FG,
+                    bordercolor=BORDER,
+                    lightcolor=BORDER,
+                    darkcolor=BORDER,
+                    insertcolor=FG,
+                    relief="flat",
+                    padding=px(3))
+    style.map("TCombobox",
+              fieldbackground=[("readonly", "focus", BG_INPUT),
+                               ("readonly", BG_INPUT),
+                               ("disabled", BG_ALT)],
+              background=[("active", BG_HOVER), ("disabled", BG_ALT)],
+              foreground=[("disabled", FG_DIM)],
+              arrowcolor=[("disabled", FG_DIM)],
+              bordercolor=[("focus", ACCENT)],
+              lightcolor=[("focus", ACCENT)],
+              selectbackground=[("readonly", BG_INPUT)],
+              selectforeground=[("readonly", FG)])
+
+    # 微调数值框
+    style.configure("TSpinbox",
+                    fieldbackground=BG_INPUT,
+                    background=BG_CARD,
+                    foreground=FG,
+                    arrowcolor=FG,
+                    bordercolor=BORDER,
+                    lightcolor=BORDER,
+                    darkcolor=BORDER,
+                    insertcolor=FG,
+                    relief="flat",
+                    padding=px(3))
+    style.map("TSpinbox",
+              fieldbackground=[("readonly", BG_INPUT), ("disabled", BG_ALT)],
+              background=[("active", BG_HOVER), ("disabled", BG_ALT)],
+              foreground=[("disabled", FG_DIM)],
+              arrowcolor=[("disabled", FG_DIM)],
+              bordercolor=[("focus", ACCENT)],
+              lightcolor=[("focus", ACCENT)])
+
     style.configure("TCheckbutton", background=BG, foreground=FG, focuscolor=BG)
     style.map("TCheckbutton", background=[("active", BG)])
     style.configure("TRadiobutton", background=BG, foreground=FG, focuscolor=BG)
@@ -154,6 +246,7 @@ def apply_dark_style(root):
     style.configure("Treeview.Heading", background=BG_CARD, foreground=FG_DIM,
                     borderwidth=0, padding=(px(4), px(3)))
     style.map("Treeview", background=[("selected", "#34435c")],
+              foreground=[("selected", FG)],
               fieldbackground=[("disabled", BG_ALT)])
 
     style.configure("TNotebook", background=BG, borderwidth=0, tabmargins=(px(6), px(6), px(6), 0))

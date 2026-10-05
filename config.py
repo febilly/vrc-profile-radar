@@ -94,6 +94,7 @@ DEFAULT_CONFIG = {
         "always_on_top": True,
         "alpha": 0.9,
         "show_avatars": True,
+        "overlay_max_rows": 20,
         "overlay_x": -1,
         "overlay_y": -1,
         "main_w": 760,

@@ -967,6 +967,18 @@ class SettingsTab(ttk.Frame):
         ttk.Checkbutton(box, text="窗口置顶", variable=self.vars[("ui", "always_on_top")],
                         command=self._on_flag).grid(row=2, column=1, sticky="w", pady=3)
 
+        ttk.Label(box, text="单列最大行数").grid(row=3, column=0, sticky="e", padx=(0, 8), pady=3)
+        row_box = ttk.Frame(box)
+        row_box.grid(row=3, column=1, sticky="w", pady=3)
+        max_rows_val = str(self.config.get("ui", "overlay_max_rows", default=20) or 20)
+        self.vars[("ui", "overlay_max_rows")] = tk.StringVar(value=max_rows_val)
+        spin = ttk.Spinbox(row_box, from_=3, to=100, width=6,
+                           textvariable=self.vars[("ui", "overlay_max_rows")],
+                           command=self._on_max_rows)
+        spin.pack(side="left")
+        self.vars[("ui", "overlay_max_rows")].trace_add("write", lambda *_: self._on_max_rows())
+        ttk.Label(row_box, text="行（超出后自动分列显示）").pack(side="left", padx=(6, 0))
+
     def _on_alpha(self, _value=None):
         if self._loading:
             return
@@ -981,6 +993,18 @@ class SettingsTab(ttk.Frame):
             return
         self.config.set(bool(self.vars[("ui", "show_avatars")].get()), "ui", "show_avatars")
         self.config.set(bool(self.vars[("ui", "always_on_top")].get()), "ui", "always_on_top")
+        self._schedule_apply()
+        self._hint("更改即时生效")
+
+    def _on_max_rows(self):
+        if self._loading:
+            return
+        try:
+            val = int(self.vars[("ui", "overlay_max_rows")].get())
+            val = max(1, min(200, val))
+        except (ValueError, TypeError):
+            return
+        self.config.set(val, "ui", "overlay_max_rows")
         self._schedule_apply()
         self._hint("更改即时生效")
 

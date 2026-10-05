@@ -152,6 +152,10 @@ def test_exclude_mutual_rules():
     mrule2 = Rule.from_dict({"name": "共2", "type": "mutual_friends", "operator": "<=", "count": "x"})
     check("共同好友数量非法回退默认5", mrule2.operator == "<=" and mrule2.count == 5)
     check("规则to_dict往返", Rule.from_dict(rule.to_dict()).users == rule.users)
+    mrule_limit = Rule.from_dict({"name": "共3", "type": "mutual_friends", "limit_users": True,
+                                  "users": [{"user_id": "usr_tgt", "name": "Target"}]})
+    check("共同好友限定名单解析", mrule_limit.limit_users is True and len(mrule_limit.users) == 1)
+    check("共同好友限定名单to_dict往返", Rule.from_dict(mrule_limit.to_dict()).limit_users is True)
 
     # 导入导出：排除/共同好友是合法类型；排除规则一个条件都没选算无效
     ok, skipped = load_rules_payload([
@@ -216,9 +220,17 @@ def test_cache():
         store.put_mutual_count("me", "usr_a", 9)
         check("共同好友缓存覆盖", store.get_mutual_count("me", "usr_a")[0] == 9)
         check("不同me键隔离", store.get_mutual_count("other", "usr_a") == (None, 0.0))
+        # 共同好友列表缓存
+        store.put_mutual_friends("me", "usr_a", [{"id": "f1", "displayName": "F1"}])
+        flist, fat = store.get_mutual_friends("me", "usr_a")
+        check("共同好友列表缓存读写", flist == [{"id": "f1", "displayName": "F1"}] and fat > 0)
+        check("共同好友列表缓存未命中", store.get_mutual_friends("me", "usr_b") == (None, 0.0))
+        store.put_mutual_friends("me", "usr_a", [{"id": "f2", "displayName": "F2"}])
+        check("共同好友列表缓存覆盖", store.get_mutual_friends("me", "usr_a")[0] == [{"id": "f2", "displayName": "F2"}])
         store.put_profile("usr_z", {"displayName": "Z"})
         store.clear_profiles()
         check("清空简介缓存连共同好友一起清", store.get_mutual_count("me", "usr_a") == (None, 0.0)
+              and store.get_mutual_friends("me", "usr_a") == (None, 0.0)
               and store.get_profile("usr_z")[0] is None)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
@@ -361,6 +373,11 @@ def test_pipeline_exclusion():
             # Charlie 假数据共同好友 10 个（≥5 命中），Jack 2 个（不命中）
             {"id": "mu", "name": "共同好友", "type": "mutual_friends",
              "operator": ">=", "count": 5},
+            # 指定名单筛选共同好友：Charlie 共同好友含 Alice 和 Bob（≥2 命中），Jack 只有 Alice（不命中）
+            {"id": "mu_lim", "name": "限定共同好友", "type": "mutual_friends",
+             "operator": ">=", "count": 2, "limit_users": True,
+             "users": [{"user_id": "usr_cccccccc-1111-2222-3333-444444444444", "name": "Alice"},
+                       {"user_id": "usr_dddddddd-1111-2222-3333-444444444444", "name": "Bob"}]},
         ], "rules")
         cfg.set("", "cookies", "auth")
 
@@ -377,7 +394,7 @@ def test_pipeline_exclusion():
             with matcher._lock:
                 matches = {m["user_id"]: m for m in matcher._matches.values()}
             names = {m["name"] for m in matches.values()}
-            if "Charlie" in names:
+            if "Charlie" in names and not matcher._scanning:
                 break
             time.sleep(0.2)
 
@@ -389,12 +406,15 @@ def test_pipeline_exclusion():
         jack_rules = {r["name"] for r in matches[
             "usr_bbbbbbbb-1111-2222-3333-444444444444"]["rules"]} if \
             "usr_bbbbbbbb-1111-2222-3333-444444444444" in matches else set()
-        check("共同好友<5：Jack 只有关键词命中", "共同好友" not in jack_rules, str(jack_rules))
+        check("共同好友<5：Jack 只有关键词命中", "共同好友" not in jack_rules and "限定共同好友" not in jack_rules, str(jack_rules))
         charlie_rules = {r["name"]: r.get("reason", "") for r in matches[
             "usr_eeeeeeee-1111-2222-3333-444444444444"]["rules"]} if \
             "usr_eeeeeeee-1111-2222-3333-444444444444" in matches else {}
         check("共同好友理由带数量", charlie_rules.get("共同好友") == "共同好友 10 人",
               str(charlie_rules))
+        check("限定共同好友≥2：Charlie 命中", "限定共同好友" in charlie_rules, str(charlie_rules))
+        check("限定共同好友理由只显示人数不含人名",
+              charlie_rules.get("限定共同好友") == "指定共同好友 2 人", str(charlie_rules))
         check("自己永远被排除", "DemoLocalUser" not in names)
 
         # 好友列表已加载且来源正确
@@ -486,11 +506,63 @@ def test_data_dir_properties():
         check("Config.backup_dir 对齐", cfg.backup_dir == os.path.join(target, "backups"))
         check("规则可正常读取", cfg.get("rules")[0]["name"] == "测试规则")
 
+        # 验证默认配置项
+        check("默认 overlay_max_rows 为 20", cfg.get("ui", "overlay_max_rows") == 20)
+
         # 验证默认 DATA_DIR 位于系统标准目录且不与源码目录重合
         default_dir = config_mod.get_default_data_dir()
         check("默认数据目录名称为 VRCProfileRadar", os.path.basename(default_dir) == "VRCProfileRadar")
         check("默认数据目录不在代码自身目录下", os.path.abspath(default_dir) != os.path.abspath(os.path.dirname(__file__)))
     finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_overlay_logic():
+    print("== 悬浮窗分列与匹配签名逻辑 ==")
+    from overlay import Overlay
+    # 验证匹配签名在内容相同/不同时的表现
+    m1 = [{"user_id": "u1", "name": "A", "rules": [{"id": "r1", "name": "R1", "color": "#fff", "reason": "X"}]}]
+    m2 = [{"user_id": "u1", "name": "A", "rules": [{"id": "r1", "name": "R1", "color": "#fff", "reason": "X"}]}]
+    m3 = [{"user_id": "u1", "name": "A", "rules": [{"id": "r1", "name": "R1", "color": "#000", "reason": "X"}]}]
+    s1 = Overlay._matches_signature(None, m1)
+    s2 = Overlay._matches_signature(None, m2)
+    s3 = Overlay._matches_signature(None, m3)
+    check("相同匹配项签名一致", s1 == s2)
+    check("不同匹配项签名不同", s1 != s3)
+
+    # 验证多列切片逻辑
+    items = list(range(45))
+    max_rows = 20
+    columns = [items[i:i + max_rows] for i in range(0, len(items), max_rows)]
+    check("45 项按 20 行切分为 3 列", len(columns) == 3)
+    check("第一列为 20 项", len(columns[0]) == 20)
+    check("第二列为 20 项", len(columns[1]) == 20)
+    check("第三列为 5 项", len(columns[2]) == 5)
+
+    # 验证任务栏窗口属性
+    import tkinter as tk
+    import ctypes
+    root = tk.Tk()
+    root.withdraw()
+    tmpdir = tempfile.mkdtemp()
+    try:
+        tmp_cfg = config_mod.Config(os.path.join(tmpdir, "c.json"))
+        tmp_cache = CacheStore(os.path.join(tmpdir, "c.db"))
+        ov = Overlay(root, tmp_cfg, Matcher(tmp_cfg, tmp_cache), open_main=lambda: None, on_quit=lambda: None)
+        check("悬浮窗标题明确", "悬浮窗" in ov.top.title())
+        if hasattr(ctypes, "windll"):
+            for _ in range(5):
+                root.update()
+                time.sleep(0.01)
+            user32 = ctypes.windll.user32
+            hwnd = user32.GetParent(ov.top.winfo_id()) or ov.top.winfo_id()
+            ex_style = user32.GetWindowLongW(hwnd, -20)
+            style = user32.GetWindowLongW(hwnd, -16)
+            check("悬浮窗在任务栏可见(WS_EX_APPWINDOW)", bool(ex_style & 0x00040000))
+            check("悬浮窗非TOOLWINDOW", not bool(ex_style & 0x00000080))
+            check("悬浮窗支持任务栏最小化(WS_MINIMIZEBOX)", bool(style & 0x00020000))
+    finally:
+        root.destroy()
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
@@ -557,6 +629,445 @@ def test_rules_import_export():
     check("与现有配置去重", rule_signature(same_content) == rule_signature(existing_rule))
 
 
+def test_dark_theme_styles():
+    print("== 深色主题与控件样式 ==")
+    import tkinter as tk
+    from tkinter import ttk
+    import theme
+
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        theme.apply_dark_style(root)
+        s = ttk.Style(root)
+
+        # 1. Combobox 深色只读配置
+        cb = ttk.Combobox(root, state="readonly", values=[">=", "<="])
+        cb.set(">=")
+        cb.pack()
+        root.update()
+
+        ro_fieldbg = s.lookup("TCombobox", "fieldbackground", state=["readonly"])
+        ro_fg = s.lookup("TCombobox", "foreground", state=["readonly"])
+        check("Combobox 只读底色为深色BG_INPUT", ro_fieldbg == theme.BG_INPUT, repr(ro_fieldbg))
+        check("Combobox 只读字色为浅色FG", ro_fg == theme.FG, repr(ro_fg))
+
+        # 2. Combobox 弹出列表
+        popdown = root.tk.eval(f"ttk::combobox::PopdownWindow {cb}")
+        pop_bg = root.tk.eval(f"{popdown}.f.l cget -bg")
+        pop_fg = root.tk.eval(f"{popdown}.f.l cget -fg")
+        pop_selbg = root.tk.eval(f"{popdown}.f.l cget -selectbackground")
+        check("Combobox 下拉列表底色为深色", pop_bg == theme.BG_INPUT, repr(pop_bg))
+        check("Combobox 下拉列表字色为浅色", pop_fg == theme.FG, repr(pop_fg))
+        check("Combobox 下拉列表选中背景为暗蓝", pop_selbg == "#34435c", repr(pop_selbg))
+
+        # 3. Spinbox 样式
+        spin = ttk.Spinbox(root, from_=3, to=100)
+        spin.pack()
+        root.update()
+        sp_fieldbg = s.lookup("TSpinbox", "fieldbackground", state=[])
+        sp_fg = s.lookup("TSpinbox", "foreground", state=[])
+        check("Spinbox 底色为深色BG_INPUT", sp_fieldbg == theme.BG_INPUT, repr(sp_fieldbg))
+        check("Spinbox 字色为浅色FG", sp_fg == theme.FG, repr(sp_fg))
+
+        # 4. 原生 Text / Listbox 的全局配置生效
+        top = tk.Toplevel(root)
+        txt = tk.Text(top)
+        lb = tk.Listbox(top)
+        check("Text 全局底色为深色", str(txt.cget("bg")) == theme.BG_INPUT)
+        check("Text 全局光标颜色为浅色", str(txt.cget("insertbackground")) == theme.FG)
+        check("Listbox 全局底色为深色", str(lb.cget("bg")) == theme.BG_INPUT)
+        check("Listbox 全局字色为浅色", str(lb.cget("fg")) == theme.FG)
+        top.destroy()
+    finally:
+        root.destroy()
+
+
+def test_rule_change_overlay_refresh():
+    print("== 规则修改与悬浮窗实时刷新 ==")
+    import tkinter as tk
+    import demo
+    root = tk.Tk()
+    root.withdraw()
+    tmpdir = tempfile.mkdtemp()
+    try:
+        cfg = config_mod.Config(os.path.join(tmpdir, "cfg.json"))
+        cache = CacheStore(os.path.join(tmpdir, "cache.db"))
+        # 初始规则：只有关键词 "日语"
+        r1 = {"id": "r_jp", "name": "日语", "type": "keyword", "keywords": ["日本語", "日语"], "enabled": True}
+        cfg.set([r1], "rules")
+
+        matcher = Matcher(cfg, cache, api=None)
+        demo.setup(matcher, cfg)
+        matcher.start()
+
+        from overlay import Overlay
+        ov = Overlay(root, cfg, matcher, open_main=lambda: None, on_quit=lambda: None)
+
+        # 等待初始匹配完成（星野くるみ 简介有 日语）
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            root.update()
+            if any(m.get("name") == "星野くるみ" for m in ov.matches):
+                break
+            time.sleep(0.05)
+
+        check("初始状态：星野くるみ已命中并在悬浮窗", any(m.get("name") == "星野くるみ" for m in ov.matches))
+        check("初始状态：Diana未命中", not any(m.get("name") == "Diana" for m in ov.matches))
+
+        # 场景1：修改规则（新增一条规则匹配 Diana 的 "摄影"）
+        r2 = {"id": "r_photo", "name": "摄影", "type": "keyword", "keywords": ["摄影"], "enabled": True}
+        cfg.set([r1, r2], "rules")
+        matcher.rescan(immediate=True)
+
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            root.update()
+            if any(m.get("name") == "Diana" for m in ov.matches):
+                break
+            time.sleep(0.05)
+
+        check("新增规则后：Diana 立即出现在悬浮窗", any(m.get("name") == "Diana" for m in ov.matches))
+
+        # 场景2：禁用日语规则
+        r1_disabled = dict(r1, enabled=False)
+        cfg.set([r1_disabled, r2], "rules")
+        matcher.rescan(immediate=True)
+
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            root.update()
+            if not any(m.get("name") == "星野くるみ" for m in ov.matches):
+                break
+            time.sleep(0.05)
+
+        check("禁用日语规则后：星野くるみ 从悬浮窗移除", not any(m.get("name") == "星野くるみ" for m in ov.matches))
+        check("Diana 仍然保持命中", any(m.get("name") == "Diana" for m in ov.matches))
+
+        # 场景3：修改规则颜色，悬浮窗签名感知并更新
+        r2_colored = dict(r2, color="#00ffcc")
+        cfg.set([r1_disabled, r2_colored], "rules")
+        matcher.rescan(immediate=True)
+
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            root.update()
+            diana = next((m for m in ov.matches if m.get("name") == "Diana"), None)
+            if diana and any(r.get("color") == "#00ffcc" for r in diana.get("rules", [])):
+                break
+            time.sleep(0.05)
+
+        diana = next((m for m in ov.matches if m.get("name") == "Diana"), None)
+        color_applied = diana and any(r.get("color") == "#00ffcc" for r in diana.get("rules", []))
+        check("修改规则颜色后：悬浮窗规则标签颜色同步更新", color_applied)
+
+        matcher.stop()
+    finally:
+        root.destroy()
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_plugins_and_placeholders():
+    print("== 插件系统与 {count} 占位符 ==")
+    import json
+    from plugin_manager import PluginManager, PluginUserInfo, DirectoryPlugin
+    from rules import format_rule_display_name
+
+    # 1. 占位符替换测试
+    check("format_rule_display_name 基础替换",
+          format_rule_display_name("共同好友({count})", 5) == "共同好友(5)")
+    check("format_rule_display_name {n}替换",
+          format_rule_display_name("大群好友: {n}人", 12) == "大群好友: 12人")
+    check("format_rule_display_name 大小写不敏感",
+          format_rule_display_name("好友{COUNT}", 3) == "好友3")
+    check("format_rule_display_name 无占位符保持原样",
+          format_rule_display_name("固定规则名", 8) == "固定规则名")
+
+    # 2. 插件管理器加载测试（在临时目录构造独立插件环境，不依赖外部或开发目录）
+    tmpdir = tempfile.mkdtemp(prefix="vrc_test_pm_")
+    try:
+        mock_dev_dir = os.path.join(tmpdir, "plugins_dev", "user_search")
+        os.makedirs(mock_dev_dir, exist_ok=True)
+        with open(os.path.join(mock_dev_dir, "plugin.json"), "w", encoding="utf-8") as f:
+            json.dump({
+                "id": "user_search",
+                "name": "用户查找",
+                "version": "1.0.0",
+                "enabled": True,
+                "rule_types": [{
+                    "type": "user_search",
+                    "name": "用户查找",
+                    "default_name": "示例查找",
+                    "default_color": "#ffd700",
+                    "fields": [
+                        {"key": "server_domain", "type": "text", "default": "example.com"},
+                        {"key": "admin_url_template", "type": "text", "default": "https://example.com/admin/#/users?search={code}&open=1"}
+                    ]
+                }]
+            }, f, ensure_ascii=False, indent=2)
+        with open(os.path.join(mock_dev_dir, "plugin.py"), "w", encoding="utf-8") as f:
+            f.write(
+                "import re, urllib.parse\n"
+                "class Plugin:\n"
+                "    def __init__(self, context=None):\n"
+                "        self.context = context\n"
+                "    def match(self, context, user_info, rule=None):\n"
+                "        rule = rule or {}\n"
+                "        server_domain = rule.get('server_domain') or 'example.com'\n"
+                "        admin_url_template = rule.get('admin_url_template') or 'https://example.com/admin/#/users?search={code}&open=1'\n"
+                "        tag_text = rule.get('name') or '示例查找'\n"
+                "        tag_color = rule.get('color') or '#ffd700'\n"
+                "        pattern = re.compile(rf'{re.escape(server_domain)}[^\\s\"\\']*?[?&#]r=([a-zA-Z0-9_-]+)', re.IGNORECASE)\n"
+                "        texts = list(user_info.bio_links or user_info.bioLinks or [])\n"
+                "        if user_info.bio:\n"
+                "            texts.append(user_info.bio)\n"
+                "        for t in texts:\n"
+                "            m = pattern.search(str(t))\n"
+                "            if m:\n"
+                "                code = m.group(1).strip()\n"
+                "                return {\n"
+                "                    'tag_text': tag_text,\n"
+                "                    'tag_color': tag_color,\n"
+                "                    'reason': f'邀请码: {code}',\n"
+                "                    'action': {'type': 'open_url', 'url': admin_url_template.replace('{code}', urllib.parse.quote(code))}\n"
+                "                }\n"
+                "        return None\n"
+            )
+
+        cfg = config_mod.Config(os.path.join(tmpdir, "config.json"))
+        pm = PluginManager(cfg, project_dir=tmpdir)
+        plugins = pm.get_all_plugins()
+        builtin_ids = {p.id for p in plugins if p.is_builtin}
+        check("内置插件全部加载",
+              {"builtin_keyword", "builtin_regex", "builtin_mutual_friends", "builtin_llm", "builtin_exclude"}.issubset(builtin_ids))
+
+        # 3. 验证开发目录下的「用户查找」插件
+        user_search_plugin = pm.plugins.get("user_search")
+        check("「用户查找」插件被发现", user_search_plugin is not None)
+        if user_search_plugin:
+            check("插件名称为「用户查找」", user_search_plugin.name == "用户查找")
+            check("插件来源为 dev", user_search_plugin.source == "dev")
+
+            # 4. 测试匹配功能
+            # 命中测试
+            u1 = PluginUserInfo(
+                user_id="usr_test_1",
+                displayName="TranslatorUser",
+                bio="欢迎使用插件测试",
+                bioLinks=["https://example.com/?r=demo_code_999"],
+            )
+            res1 = user_search_plugin.match(pm, u1)
+            check("用户查找插件命中", res1 is not None)
+            if res1:
+                check("标签名称为「示例查找」", res1.get("tag_text") == "示例查找")
+                check("标签颜色为金黄色(#ffd700)", res1.get("tag_color") == "#ffd700")
+                action = res1.get("action") or {}
+                check("动作为 open_url", action.get("type") == "open_url")
+                expected_url = "https://example.com/admin/#/users?search=demo_code_999&open=1"
+                check("邀请码提取正确且目标URL精确", action.get("url") == expected_url)
+
+            # 未命中测试
+            u2 = PluginUserInfo(
+                user_id="usr_test_2",
+                displayName="NormalUser",
+                bio="hello world",
+                bioLinks=["https://twitter.com/example"],
+            )
+            res2 = user_search_plugin.match(pm, u2)
+            check("普通用户不命中", res2 is None)
+
+        # 5. 插件启用/禁用切换与持久化
+        pm.set_plugin_enabled("user_search", False)
+        check("设置插件禁用生效", pm.is_disabled("user_search"))
+        check("内存对象状态同步禁用", not pm.plugins["user_search"].enabled)
+        pm.set_plugin_enabled("user_search", True)
+        check("重新启用插件生效", not pm.is_disabled("user_search"))
+
+        # 6. 流水线集成与 {count} 替换测试
+        cache = CacheStore(os.path.join(tmpdir, "cache.db"))
+        m_rule = {
+            "id": "test-mutual-placeholder",
+            "name": "密友({count})",
+            "type": "mutual_friends",
+            "operator": ">=",
+            "count": 1,
+            "limit_users": False,
+            "users": [],
+            "color": "#ffb84d",
+            "enabled": True,
+        }
+        # 初始规则仅包含共同好友规则（未添加插件规则）
+        cfg.set([m_rule], "rules")
+
+        class TestAPI:
+            configured = True
+            def get_me(self):
+                return {"id": "usr_me"}
+            def get_friends(self):
+                return []
+            def get_mutual_counts(self, uid):
+                return {"friends": 7}
+            def get_mutual_friends(self, uid):
+                return [{"id": "usr_friend_1", "displayName": "MutualFriend1"}]
+
+        matcher = Matcher(cfg, cache, api=TestAPI())
+        matcher.plugin_manager = pm
+        profile_match = {
+            "displayName": "DemoFan",
+            "bio": "测试",
+            "bioLinks": ["https://example.com/?r=demo_code_999"],
+        }
+        matcher._profiles["usr_target"] = profile_match
+        matcher._apply_local_rules("usr_target", profile_match)
+        matcher._apply_plugin_rules("usr_target", profile_match)
+        entry0 = matcher._matches.get("usr_target")
+        check("未配置插件规则时不静默匹配", not any(r.get("type") == "plugin" for r in (entry0 or {}).get("rules", [])))
+
+        # 手动向配置中添加并启用该插件规则
+        p_rule = {
+            "id": "test-user-search-rule",
+            "name": "示例查找",
+            "type": "user_search",
+            "color": "#ffd700",
+            "enabled": True,
+        }
+        cfg.set([m_rule, p_rule], "rules")
+        matcher._apply_plugin_rules("usr_target", profile_match)
+        matcher._run_mutual_rules([{"user_id": "usr_target", "name": "DemoFan"}], excluded=set())
+
+        entry = matcher._matches.get("usr_target")
+        check("流水线中生成了匹配条目", entry is not None)
+        if entry:
+            rules_hit = {r.get("id"): r for r in entry.get("rules", [])}
+            # 检查插件标签
+            plugin_tag = next((r for r in entry.get("rules", []) if r.get("type") == "plugin"), None)
+            check("流水线包含插件生成的金黄色标签", plugin_tag and plugin_tag.get("name") == "示例查找" and plugin_tag.get("color") == "#ffd700")
+            # 检查共同好友 {count} 替换
+            mutual_tag = rules_hit.get("test-mutual-placeholder")
+            check("共同好友标签成功替换占位符为「密友(7)」", mutual_tag and mutual_tag.get("name") == "密友(7)")
+            check("共同好友携带 detail 动作", mutual_tag and mutual_tag.get("action", {}).get("type") == "detail")
+
+        # 禁用插件规则后重新匹配
+        cfg.set([m_rule, dict(p_rule, enabled=False)], "rules")
+        matcher._apply_plugin_rules("usr_target", profile_match)
+        entry_disabled = matcher._matches.get("usr_target")
+        check("插件规则禁用后不匹配", not any(r.get("type") == "plugin" for r in (entry_disabled or {}).get("rules", [])))
+
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_detail_mutuals_and_avatar():
+    print("== 详情弹窗共同好友与头像加载 ==")
+    import hashlib
+    import tkinter as tk
+    from unittest.mock import patch, MagicMock
+    try:
+        from PIL import Image
+        has_pil = True
+    except ImportError:
+        has_pil = False
+    from overlay import Overlay
+
+    tmpdir = tempfile.mkdtemp()
+    root = None
+    try:
+        cfg = config_mod.Config(os.path.join(tmpdir, "config.json"))
+        cache = CacheStore(os.path.join(tmpdir, "cache.db"))
+
+        class MockAPI:
+            configured = True
+            _headers = {"User-Agent": "CustomVRChatAgent/1.0"}
+            auth_cookie = "test_auth"
+            two_factor_cookie = "test_2fa"
+
+            def get_me(self):
+                return {"id": "usr_me"}
+
+            def get_mutual_friends(self, uid):
+                return [{"id": "usr_mf_1", "displayName": "FriendOne"}]
+
+        api = MockAPI()
+        matcher = Matcher(cfg, cache, api=api)
+        uid = "usr_avatar_test"
+        url = "https://api.vrchat.cloud/api/1/image/file_123/1/256"
+
+        # 1. 头像请求携带 UA 与 Cookies 验证
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.content = b"FAKE_PNG_DATA"
+        with patch("requests.get", return_value=mock_resp) as mock_get:
+            events = []
+            matcher.emit = lambda ev: events.append(ev)
+            matcher._fetch_avatar(uid, url)
+            check("头像请求调用了 requests.get", mock_get.called)
+            if mock_get.called:
+                _, kwargs = mock_get.call_args
+                check("头像请求携带自定义 User-Agent", kwargs.get("headers", {}).get("User-Agent") == "CustomVRChatAgent/1.0")
+                check("头像请求携带 auth cookie", kwargs.get("cookies", {}).get("auth") == "test_auth")
+                check("头像请求携带 twoFactorAuth cookie", kwargs.get("cookies", {}).get("twoFactorAuth") == "test_2fa")
+            check("头像拉取触发 avatar 事件", len(events) == 1 and events[0].get("data") == b"FAKE_PNG_DATA")
+
+            # 本地磁盘缓存命中验证
+            mock_get.reset_mock()
+            events.clear()
+            matcher._fetch_avatar(uid, url)
+            check("本地存在磁盘缓存时直接读取不发网络请求", not mock_get.called)
+            check("缓存命中仍然发射 avatar 事件", len(events) == 1 and events[0].get("data") == b"FAKE_PNG_DATA")
+
+        # 2. 详情弹窗共同好友异步渲染与头像持有验证
+        root = tk.Tk()
+        root.withdraw()
+        ov = Overlay(root, cfg, matcher, lambda: None, lambda: None)
+
+        if has_pil:
+            os.makedirs(matcher.avatar_dir, exist_ok=True)
+            img = Image.new("RGBA", (32, 32), color="purple")
+            img_path = os.path.join(matcher.avatar_dir, hashlib.md5(uid.encode()).hexdigest() + ".png")
+            img.save(img_path)
+
+        match = {
+            "user_id": uid,
+            "name": "TestUser",
+            "rules": [{"id": "r1", "name": "测试标签", "color": "#ff0000"}],
+            "profile": {"bio": "Hello World", "bioLinks": []},
+        }
+        win = ov._show_detail(match)
+        check("详情弹窗成功创建", win is not None and win.winfo_exists())
+
+        def find_labels(widget):
+            res = []
+            if isinstance(widget, tk.Label):
+                res.append(widget.cget("text"))
+            for child in widget.winfo_children():
+                res.extend(find_labels(child))
+            return res
+
+        found_mutual = False
+        for _ in range(30):
+            ov._drain_ui()
+            root.update()
+            time.sleep(0.05)
+            labels = find_labels(win)
+            if any("FriendOne" in t for t in labels):
+                found_mutual = True
+                break
+
+        check("详情弹窗异步渲染公开共同好友", found_mutual)
+        check("共同好友数量标题正确更新", any("共同好友 (1)" in t for t in labels))
+        if has_pil:
+            check("详情弹窗持有 _detail_photo 引用防 GC", getattr(win, "_detail_photo", None) is not None)
+
+        win.destroy()
+    finally:
+        if root:
+            try:
+                root.destroy()
+            except Exception:
+                pass
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def run():
     print("开始自检（不联网、不依赖 VRChat）\n")
     test_log_parsing()
@@ -568,9 +1079,14 @@ def run():
     test_extract_json()
     test_config_backup()
     test_data_dir_properties()
+    test_overlay_logic()
     test_rules_import_export()
+    test_dark_theme_styles()
     test_pipeline()
     test_pipeline_exclusion()
+    test_rule_change_overlay_refresh()
+    test_plugins_and_placeholders()
+    test_detail_mutuals_and_avatar()
     print("\n结果: %d 通过, %d 失败" % (PASS, FAIL))
     return FAIL == 0
 

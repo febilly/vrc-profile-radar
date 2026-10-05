@@ -835,11 +835,13 @@ class Matcher:
 
     def _request_avatars(self):
         with self._lock:
-            items = [(m["user_id"], (m.get("profile") or {}).get("avatar", ""))
-                     for m in self._matches.values()]
+            items = []
+            for uid, m in self._matches.items():
+                p = self._profiles.get(uid) or m.get("profile") or {}
+                url = p.get("avatar", "")
+                if url:
+                    items.append((uid, url))
         for uid, url in items:
-            if not url:
-                continue
             self._avatar_pool.submit(self._fetch_avatar, uid, url)
 
     def _fetch_avatar(self, uid, url):

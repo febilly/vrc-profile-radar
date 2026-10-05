@@ -188,13 +188,25 @@ class UserSearchDialog(tk.Toplevel):
         self.destroy()
 
     def _fetch_avatars(self):
+        api = self.get_api() if callable(self.get_api) else self.get_api
+        headers = {}
+        if api and hasattr(api, "_headers"):
+            headers["User-Agent"] = api._headers.get("User-Agent") or "profile-check/1.0"
+        else:
+            headers["User-Agent"] = "profile-check/1.0 (personal VRChat profile matcher; contact: local-user)"
+        cookies = {}
+        if api and getattr(api, "auth_cookie", None):
+            cookies["auth"] = api.auth_cookie
+            if getattr(api, "two_factor_cookie", None):
+                cookies["twoFactorAuth"] = api.two_factor_cookie
+
         for idx, row in enumerate(self._rows):
             url = _avatar_url(row["user"])
             if not url:
                 continue
             try:
-                resp = requests.get(url, timeout=15)
-                if resp.status_code == 200:
+                resp = requests.get(url, headers=headers, cookies=cookies, timeout=15)
+                if resp.status_code == 200 and resp.content:
                     self._events.put(("avatar", idx, resp.content))
             except Exception:
                 continue

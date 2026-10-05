@@ -4,6 +4,7 @@
 与悬浮窗分离：悬浮窗只负责游戏内显示匹配结果；主面板负责配置，关掉即隐藏。
 """
 import json
+import os
 import re
 import threading
 import time
@@ -57,15 +58,31 @@ def rule_summary(rule):
             parts.append("名单%d人" % len(users))
         return "排除：" + ("、".join(parts) if parts else "未选条件")
     if t == MUTUAL:
-        return "共同好友%s%s人" % (OPERATOR_DISPLAY.get(rule.get("operator", ">="), "≥"),
-                                rule.get("count", 5))
-    return ""
+        op_str = OPERATOR_DISPLAY.get(rule.get("operator", ">="), "≥")
+        cnt = rule.get("count", 5)
+        if rule.get("limit_users"):
+            u_len = len(rule.get("users") or [])
+            return "指定共同好友%s%s人（名单%d人）" % (op_str, cnt, u_len)
+        return "共同好友%s%s人" % (op_str, cnt)
+    for k in ("server_domain", "admin_url_template", "pattern", "description"):
+        v = rule.get(k)
+        if v:
+            return short_text(str(v), 16)
+    return "插件规则"
 
 
-def tree_values(rule):
+def tree_values(rule, matcher=None):
+    rtype = rule.get("type")
+    type_name = TYPE_LABEL.get(rtype)
+    if not type_name and matcher and getattr(matcher, "plugin_manager", None):
+        rt_def = matcher.plugin_manager.get_rule_type(rtype)
+        if rt_def:
+            type_name = rt_def.get("name")
+    if not type_name:
+        type_name = rtype
     return ("✓" if rule.get("enabled", True) else "×",
             short_text(rule.get("name", ""), 10),
-            TYPE_LABEL.get(rule.get("type"), rule.get("type")),
+            type_name,
             rule_summary(rule))
 
 
@@ -89,16 +106,47 @@ class MainWindow:
 
         notebook = ttk.Notebook(self.top)
         notebook.pack(fill="both", expand=True, padx=8, pady=8)
-        self.rule_editor = RuleEditor(notebook, config, get_api=lambda: self.matcher.api)
+        self.rule_editor = RuleEditor(notebook, config, get_api=lambda: self.matcher.api,
+                                      on_rules_changed=self._on_rules_changed, matcher=matcher)
         self.status_tab = StatusTab(notebook, matcher)
+        self.plugins_tab = PluginsTab(notebook, matcher, config,
+                                      on_plugins_changed=self._on_plugins_changed)
         self.settings_tab = SettingsTab(notebook, config, matcher, self.apply_hooks,
-                                        overlay=overlay, on_rules_changed=self._reload_rules)
+                                        overlay=overlay, on_rules_changed=self._on_rules_imported)
         notebook.add(self.rule_editor, text=" 规则 ")
         notebook.add(self.status_tab, text=" 状态 ")
+        notebook.add(self.plugins_tab, text=" 插件 ")
         notebook.add(self.settings_tab, text=" 设置 ")
+        notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+
+    def _on_tab_changed(self, event=None):
+        if hasattr(self, "rule_editor") and getattr(self.rule_editor, "_pending_wb", None):
+            self.rule_editor._flush_wb()
+
+    def _on_plugins_changed(self):
+        if hasattr(self, "rule_editor"):
+            try:
+                self.rule_editor._refresh_plugin_buttons()
+                self.rule_editor._reload_tree()
+            except Exception:
+                pass
+        self._on_rules_changed()
+
+    def _on_rules_changed(self):
+        if self.matcher:
+            self.matcher.rescan(immediate=True)
+        if hasattr(self, "status_tab"):
+            try:
+                self.status_tab._refresh()
+            except Exception:
+                pass
+
+    def _on_rules_imported(self):
+        self.rule_editor._reload_tree()
+        self._on_rules_changed()
 
     def _reload_rules(self):
-        self.rule_editor._reload_tree()
+        self._on_rules_imported()
 
     def show(self):
         self.top.deiconify()
@@ -107,6 +155,8 @@ class MainWindow:
         self.settings_tab.refresh()
 
     def _on_close(self):
+        if hasattr(self, "rule_editor") and getattr(self.rule_editor, "_pending_wb", None):
+            self.rule_editor._flush_wb()
         if self.on_quit:
             self.on_quit()
         else:
@@ -114,10 +164,12 @@ class MainWindow:
 
 
 class RuleEditor(ttk.Frame):
-    def __init__(self, parent, config, get_api=None):
+    def __init__(self, parent, config, get_api=None, on_rules_changed=None, matcher=None):
         super().__init__(parent, padding=6)
         self.config = config
         self.get_api = get_api or (lambda: None)
+        self.on_rules_changed = on_rules_changed
+        self.matcher = matcher
         self.selected_id = None
         self._pending_wb = {}     # rule_id -> writeback 函数
         self._wb_after = None
@@ -129,6 +181,11 @@ class RuleEditor(ttk.Frame):
         btn(bar, "＋AI", lambda: self._add(LLM)).pack(side="left", padx=(4, 0))
         btn(bar, "＋排除", lambda: self._add(EXCLUDE)).pack(side="left", padx=(4, 0))
         btn(bar, "＋共同好友", lambda: self._add(MUTUAL)).pack(side="left", padx=(4, 0))
+
+        self.plugin_btn_frame = ttk.Frame(bar)
+        self.plugin_btn_frame.pack(side="left", padx=(4, 0))
+        self._refresh_plugin_buttons()
+
         btn(bar, "复制", self._copy_rule).pack(side="left", padx=(12, 0))
         btn(bar, "删除", self._delete).pack(side="left", padx=(4, 0))
         btn(bar, "上移", lambda: self._move(-1)).pack(side="left", padx=(12, 0))
@@ -160,12 +217,21 @@ class RuleEditor(ttk.Frame):
         self._wb_after = self.after(WRITEBACK_DEBOUNCE_MS, self._flush_wb)
 
     def _flush_wb(self):
-        self._wb_after = None
+        if self._wb_after:
+            self.after_cancel(self._wb_after)
+            self._wb_after = None
         fns = list(self._pending_wb.values())
         self._pending_wb.clear()
+        changed = False
         for fn in fns:
             try:
                 fn()
+                changed = True
+            except Exception:
+                pass
+        if changed and self.on_rules_changed:
+            try:
+                self.on_rules_changed()
             except Exception:
                 pass
 
@@ -175,7 +241,7 @@ class RuleEditor(ttk.Frame):
             tags = self._rule_tags(rule)
             if tags and tags[0].startswith("c:"):
                 self.tree.tag_configure(tags[0], foreground=tags[0][2:])
-            self.tree.item(iid, values=tree_values(rule), tags=tags)
+            self.tree.item(iid, values=tree_values(rule, self.matcher), tags=tags)
 
     # ---- 列表 ----
 
@@ -198,13 +264,44 @@ class RuleEditor(ttk.Frame):
             if tags and tags[0].startswith("c:"):
                 self.tree.tag_configure(tags[0], foreground=tags[0][2:])
             self.tree.insert("", "end", iid=rule.get("id", ""),
-                             values=tree_values(rule), tags=tags)
+                             values=tree_values(rule, self.matcher), tags=tags)
         if selected and selected in self.tree.get_children():
             self.tree.selection_set(selected)
         elif self.tree.get_children():
             self.tree.selection_set(self.tree.get_children()[0])
 
+    def _refresh_plugin_buttons(self):
+        if not hasattr(self, "plugin_btn_frame"):
+            return
+        for w in self.plugin_btn_frame.winfo_children():
+            w.destroy()
+        pm = getattr(self.matcher, "plugin_manager", None) if self.matcher else None
+        if not pm:
+            return
+        for rt in pm.get_available_rule_types():
+            name = rt.get("name") or "插件规则"
+            btn(self.plugin_btn_frame, "＋" + name, lambda t=rt: self._add_plugin_rule(t)).pack(side="left", padx=(2, 0))
+
+    def _add_plugin_rule(self, rt):
+        rules = self._rules()
+        new_rule = {
+            "id": self.config.new_rule_id(),
+            "type": rt.get("type", "plugin"),
+            "plugin_id": rt.get("plugin_id", ""),
+            "name": rt.get("default_name") or rt.get("name") or "新插件规则",
+            "color": rt.get("default_color") or "#ffd700",
+            "enabled": True,
+        }
+        for f in rt.get("fields", []):
+            k = f.get("key")
+            if k:
+                new_rule[k] = f.get("default", "")
+        rules.append(new_rule)
+        self._save_rules(rules, select_id=new_rule["id"])
+
     def _on_select(self, _=None):
+        if self._pending_wb:
+            self._flush_wb()
         selection = self.tree.selection()
         if not selection:
             return
@@ -223,7 +320,8 @@ class RuleEditor(ttk.Frame):
             LLM: {"name": "新AI规则", "prompt": ""},
             EXCLUDE: {"name": "排除规则", "exclude_self": True, "exclude_friends": False,
                       "users": []},
-            MUTUAL: {"name": "新共同好友规则", "operator": ">=", "count": 5},
+            MUTUAL: {"name": "新共同好友规则", "operator": ">=", "count": 5,
+                     "limit_users": False, "users": []},
         }
         rule = {"id": self.config.new_rule_id(), "type": rule_type, "enabled": True,
                 **defaults[rule_type]}
@@ -269,6 +367,11 @@ class RuleEditor(ttk.Frame):
         self.config.set(rules, "rules")
         self.selected_id = select_id or self.selected_id
         self._reload_tree()
+        if self.on_rules_changed:
+            try:
+                self.on_rules_changed()
+            except Exception:
+                pass
 
     # ---- 表单（更改即时写回配置） ----
 
@@ -313,12 +416,12 @@ class RuleEditor(ttk.Frame):
         def pick(cc):
             color_selected["v"] = "" if color_selected["v"] == cc else cc
             repaint_color()
-            queue()
+            flush_now()
 
         repaint_color()
 
         enabled_var = tk.BooleanVar(value=rule.get("enabled", True))
-        ttk.Checkbutton(form, text="启用", variable=enabled_var, command=lambda: queue()).grid(
+        ttk.Checkbutton(form, text="启用", variable=enabled_var, command=lambda: flush_now()).grid(
             row=row, column=3, sticky="w", padx=(12, 0), pady=4)
         row += 1
 
@@ -366,13 +469,13 @@ class RuleEditor(ttk.Frame):
                 kw_listbox.insert("end", k)
                 new_kw_var.set("")
                 err_label.config(text="")
-                queue()
+                flush_now()
 
             def del_kw(_=None):
                 for i in reversed(kw_listbox.curselection()):
                     del keywords[i]
                     kw_listbox.delete(i)
-                queue()
+                flush_now()
 
             btn(kw_tools, "添加", add_kw).pack(fill="x", pady=(6, 0))
             btn(kw_tools, "删除选中", del_kw).pack(fill="x", pady=(4, 0))
@@ -386,9 +489,9 @@ class RuleEditor(ttk.Frame):
             mode_box = ttk.Frame(form)
             mode_box.grid(row=row, column=1, columnspan=2, sticky="w", pady=4)
             ttk.Radiobutton(mode_box, text="命中任一", variable=mode_var, value="any",
-                            command=lambda: queue()).pack(side="left")
+                            command=lambda: flush_now()).pack(side="left")
             ttk.Radiobutton(mode_box, text="全部命中", variable=mode_var, value="all",
-                            command=lambda: queue()).pack(side="left", padx=(10, 0))
+                            command=lambda: flush_now()).pack(side="left", padx=(10, 0))
             row += 1
         elif rule.get("type") == REGEX:
             ttk.Label(form, text="正则表达式").grid(row=row, column=0, sticky="e", padx=(0, 6), pady=4)
@@ -423,7 +526,8 @@ class RuleEditor(ttk.Frame):
         elif rule.get("type") == LLM:
             ttk.Label(form, text="判断要求（发给大模型）").grid(row=row, column=0, sticky="ne", padx=(0, 6), pady=4)
             prompt_text = tk.Text(form, height=5, wrap="word", bg=BG_INPUT, fg=FG,
-                                  insertbackground=FG, relief="flat", padx=6, pady=4,
+                                  insertbackground=FG, selectbackground="#34435c", selectforeground=FG,
+                                  relief="flat", padx=6, pady=4,
                                   highlightthickness=1, highlightbackground=BORDER,
                                   font=(theme.FONT, 9))
             prompt_text.insert("1.0", rule.get("prompt", ""))
@@ -438,11 +542,11 @@ class RuleEditor(ttk.Frame):
         elif rule.get("type") == EXCLUDE:
             self_var = tk.BooleanVar(value=rule.get("exclude_self", False))
             ttk.Checkbutton(form, text="排除自己（游戏客户端登录的玩家）", variable=self_var,
-                            command=lambda: queue()).grid(row=row, column=1, sticky="w", pady=4)
+                            command=lambda: flush_now()).grid(row=row, column=1, sticky="w", pady=4)
             row += 1
             friends_var = tk.BooleanVar(value=rule.get("exclude_friends", False))
             ttk.Checkbutton(form, text="排除好友（Cookie 账号的好友）", variable=friends_var,
-                            command=lambda: queue()).grid(row=row, column=1, sticky="w", pady=4)
+                            command=lambda: flush_now()).grid(row=row, column=1, sticky="w", pady=4)
             row += 1
             ttk.Label(form, text="排除名单（按 uid）").grid(row=row, column=0, sticky="ne", padx=(0, 6), pady=4)
             list_row = row
@@ -473,7 +577,7 @@ class RuleEditor(ttk.Frame):
                 for i in reversed(users_listbox.curselection()):
                     del users[i]
                     users_listbox.delete(i)
-                queue()
+                flush_now()
 
             def search_add():
                 from user_search_dialog import UserSearchDialog
@@ -489,7 +593,7 @@ class RuleEditor(ttk.Frame):
                     users.append({"user_id": uid, "name": user.get("displayName", "")})
                     render_users()
                     err_label.config(text="")
-                    queue()
+                    flush_now()
 
                 UserSearchDialog(self, self.get_api, on_pick, title="搜索玩家加入排除名单")
 
@@ -509,11 +613,97 @@ class RuleEditor(ttk.Frame):
                          width=4, state="readonly").pack(side="left")
             count_var = tk.StringVar(value=str(rule.get("count", 5)))
             ttk.Entry(op_box, textvariable=count_var, width=8).pack(side="left", padx=(8, 0))
-            ttk.Label(op_box, text="人（与 Cookie 账号的共同好友，不含共同群组；"
-                                   "对方隐藏的共同好友也计入）",
-                      style="Dim.TLabel").pack(side="left", padx=(8, 0))
-            op_var.trace_add("write", lambda *_: queue())
+            ttk.Label(op_box, text="人", style="Dim.TLabel").pack(side="left", padx=(4, 0))
+            hint_lbl = ttk.Label(op_box, text="", style="Dim.TLabel")
+            hint_lbl.pack(side="left", padx=(4, 0))
+            op_var.trace_add("write", lambda *_: flush_now())
             count_var.trace_add("write", lambda *_: queue())
+            row += 1
+
+            ttk.Label(form, text="💡 提示：规则名称支持 {count} 占位符（如「共同好友({count})」），悬浮窗将自动显示实际好友数",
+                      style="Dim.TLabel").grid(row=row, column=1, columnspan=2, sticky="w", pady=(0, 4))
+            row += 1
+
+            limit_users_var = tk.BooleanVar(value=bool(rule.get("limit_users", False)))
+            mutual_users = [dict(u) for u in (rule.get("users") or [])]
+
+            users_frame = ttk.Frame(form)
+            list_row = row + 1
+
+            def update_limit_ui():
+                if limit_users_var.get():
+                    hint_lbl.config(text="（仅统计指定名单中属于对方公开共同好友的人数）")
+                    users_frame.grid(row=list_row, column=0, columnspan=3, sticky="nsew", pady=(2, 4))
+                else:
+                    hint_lbl.config(text="（与 Cookie 账号的共同好友，不含共同群组；对方隐藏的共同好友也计入）")
+                    users_frame.grid_remove()
+
+            ttk.Checkbutton(form, text="仅从指定名单中筛选共同好友（只看与对方的共同好友是否属于所选名单）",
+                            variable=limit_users_var,
+                            command=lambda: (update_limit_ui(), flush_now())).grid(
+                                row=row, column=1, columnspan=2, sticky="w", pady=4)
+            row += 1
+
+            # 构建指定共同好友名单管理面板
+            ttk.Label(users_frame, text="指定共同好友名单\n（按 uid）").grid(
+                row=0, column=0, sticky="ne", padx=(0, 6), pady=4)
+            kw_box = ttk.Frame(users_frame)
+            kw_box.grid(row=0, column=1, columnspan=2, sticky="nsew", pady=4)
+
+            list_wrap = ttk.Frame(kw_box)
+            list_wrap.pack(side="left", fill="both", expand=True)
+            m_listbox = tk.Listbox(list_wrap, height=6, bg=BG_INPUT, fg=FG, relief="flat",
+                                   highlightthickness=1, highlightbackground=BORDER,
+                                   selectbackground="#34435c", selectforeground=FG,
+                                   font=(theme.FONT, 9), exportselection=False, activestyle="none")
+            m_listbox.pack(side="left", fill="both", expand=True)
+            m_scroll = ttk.Scrollbar(list_wrap, orient="vertical", command=m_listbox.yview)
+            m_scroll.pack(side="left", fill="y")
+            m_listbox.config(yscrollcommand=m_scroll.set)
+
+            def render_m_users():
+                m_listbox.delete(0, "end")
+                for u in mutual_users:
+                    m_listbox.insert("end", "%s  (%s)" % (u.get("name", "?"), u.get("user_id", "")))
+
+            render_m_users()
+
+            def del_m_user(_=None):
+                for i in reversed(m_listbox.curselection()):
+                    del mutual_users[i]
+                    m_listbox.delete(i)
+                flush_now()
+
+            def search_add_m():
+                from user_search_dialog import UserSearchDialog
+
+                def on_pick(user):
+                    uid = user.get("id", "")
+                    if not uid:
+                        return
+                    if any(u.get("user_id") == uid for u in mutual_users):
+                        err_label.config(text="已在名单里：%s" % short_text(
+                            user.get("displayName", ""), 12), foreground=WARN)
+                        return
+                    mutual_users.append({"user_id": uid, "name": user.get("displayName", "")})
+                    render_m_users()
+                    err_label.config(text="")
+                    flush_now()
+
+                UserSearchDialog(self, self.get_api, on_pick, title="搜索玩家加入指定共同好友名单")
+
+            tools = ttk.Frame(kw_box)
+            tools.pack(side="left", fill="y", padx=(8, 0))
+            btn(tools, "搜索添加…", search_add_m).pack(fill="x", pady=(4, 0))
+            btn(tools, "删除选中", del_m_user).pack(fill="x", pady=(4, 0))
+            m_listbox.bind("<Double-Button-1>", del_m_user)
+            theme.add_tooltip(m_listbox, "双击条目可从名单移除")
+
+            ttk.Label(users_frame, text="（注：仅可比对对方公开可见的共同好友；若对方在隐私设置中隐藏了共同好友列表则无法比对）",
+                      style="Dim.TLabel").grid(row=1, column=1, columnspan=2, sticky="w", pady=(2, 0))
+            users_frame.columnconfigure(1, weight=1)
+
+            update_limit_ui()
             row += 1
 
         if rule.get("type") in (KEYWORD, REGEX):
@@ -524,14 +714,46 @@ class RuleEditor(ttk.Frame):
                 var = tk.BooleanVar(value=field_name in (rule.get("fields") or ["bio"]))
                 field_vars[field_name] = var
                 ttk.Checkbutton(fields_box, text=FIELD_LABELS[field_name], variable=var,
-                                command=lambda: queue()).pack(side="left")
+                                command=lambda: flush_now()).pack(side="left")
             row += 1
+
+        plugin_field_vars = {}
+        pm = getattr(self.matcher, "plugin_manager", None) if self.matcher else None
+        rt_def = pm.get_rule_type(rule.get("type")) if pm else None
+        if rule.get("type") not in (KEYWORD, REGEX, LLM, EXCLUDE, MUTUAL) or rt_def:
+            desc = (rt_def.get("description") if rt_def else "") or rule.get("description", "")
+            if desc:
+                ttk.Label(form, text="插件说明").grid(row=row, column=0, sticky="ne", padx=(0, 6), pady=4)
+                ttk.Label(form, text=desc, style="Dim.TLabel", wraplength=theme.px(380), justify="left").grid(
+                    row=row, column=1, columnspan=2, sticky="w", pady=4)
+                row += 1
+
+            fields_list = rt_def.get("fields", []) if rt_def else []
+            if not fields_list:
+                for k in rule.keys():
+                    if k not in ("id", "name", "type", "enabled", "color", "plugin_id"):
+                        fields_list.append({"key": k, "label": k, "default": ""})
+
+            for f_spec in fields_list:
+                k = f_spec.get("key")
+                if not k:
+                    continue
+                label = f_spec.get("label") or k
+                default_val = f_spec.get("default", "")
+                val = rule.get(k, default_val)
+                ttk.Label(form, text=label).grid(row=row, column=0, sticky="e", padx=(0, 6), pady=4)
+                var = tk.StringVar(value=str(val if val is not None else ""))
+                plugin_field_vars[k] = var
+                e = ttk.Entry(form, textvariable=var, width=38)
+                e.grid(row=row, column=1, columnspan=2, sticky="w", pady=4)
+                var.trace_add("write", lambda *_: queue())
+                row += 1
 
         err_label.grid(row=row, column=0, columnspan=3, sticky="w", pady=(8, 0))
         if rule.get("type") in (KEYWORD, LLM):
             form.rowconfigure(1, weight=1)  # 关键词列表 / AI 提示词占满剩余高度
-        if rule.get("type") == EXCLUDE:
-            form.rowconfigure(list_row, weight=1)  # 排除名单占满剩余高度
+        if rule.get("type") in (EXCLUDE, MUTUAL):
+            form.rowconfigure(list_row, weight=1)  # 名单占满剩余高度
         form.columnconfigure(1, weight=1)
 
         def writeback():
@@ -543,6 +765,9 @@ class RuleEditor(ttk.Frame):
                 current["name"] = name
             current["enabled"] = bool(enabled_var.get())
             current["color"] = color_selected["v"]
+            if plugin_field_vars:
+                for k, var in plugin_field_vars.items():
+                    current[k] = var.get().strip()
             if rule.get("type") == KEYWORD:
                 current["keywords"] = list(keywords)
                 if mode_var is not None:
@@ -578,11 +803,21 @@ class RuleEditor(ttk.Frame):
                 except ValueError:
                     err_label.config(text="数量需为整数（暂保留原值 %s）" % current.get("count", 5),
                                      foreground=WARN)
+                current["limit_users"] = bool(limit_users_var.get())
+                current["users"] = list(mutual_users)
+                if limit_users_var.get() and not mutual_users:
+                    err_label.config(text="已开启名单筛选，但尚未添加任何目标玩家", foreground=WARN)
+                elif not err_label.cget("text").startswith("数量需为整数"):
+                    err_label.config(text="")
             self._refresh_tree_item(current)
             self.config.schedule_save()
 
         def queue(_=None):
             self._queue_wb(rule_id, writeback)
+
+        def flush_now(_=None):
+            self._queue_wb(rule_id, writeback)
+            self._flush_wb()
 
         name_var.trace_add("write", lambda *_: queue())
         if rule.get("type") == REGEX:
@@ -1061,3 +1296,156 @@ class SettingsTab(ttk.Frame):
     def _clear_profiles(self):
         self.matcher.cache.clear_profiles()
         self._hint("简介缓存已清空", OK)
+
+
+class PluginsTab(ttk.Frame):
+    """插件管理选项卡：管理内置插件与外部插件（启用/禁用、热重载、目录直达）。"""
+    def __init__(self, parent, matcher, config, on_plugins_changed=None):
+        super().__init__(parent)
+        self.matcher = matcher
+        self.config = config
+        self.on_plugins_changed = on_plugins_changed
+
+        self.rowconfigure(1, weight=1)
+        self.columnconfigure(0, weight=1)
+
+        self._build_toolbar()
+        self._build_table()
+        self._build_details()
+        self._reload_tree()
+
+    def _build_toolbar(self):
+        bar = ttk.Frame(self)
+        bar.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 6))
+
+        btn(bar, "🔄 重新加载插件", self._reload_plugins).pack(side="left")
+        btn(bar, "切换启用/禁用", self._toggle_selected).pack(side="left", padx=(8, 0))
+
+        btn(bar, "📂 打开开发目录", self._open_dev_dir).pack(side="right")
+        btn(bar, "📂 打开用户目录", self._open_user_dir).pack(side="right", padx=(0, 8))
+
+    def _build_table(self):
+        table_frame = ttk.Frame(self)
+        table_frame.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 6))
+        table_frame.rowconfigure(0, weight=1)
+        table_frame.columnconfigure(0, weight=1)
+
+        cols = ("enabled", "name", "id", "version", "source", "status")
+        self.tree = ttk.Treeview(table_frame, columns=cols, show="headings", selectmode="browse")
+        self.tree.heading("enabled", text="启用")
+        self.tree.heading("name", text="插件名称")
+        self.tree.heading("id", text="标识符 (ID)")
+        self.tree.heading("version", text="版本")
+        self.tree.heading("source", text="来源")
+        self.tree.heading("status", text="状态")
+
+        self.tree.column("enabled", width=50, anchor="center")
+        self.tree.column("name", width=180, anchor="w")
+        self.tree.column("id", width=140, anchor="w")
+        self.tree.column("version", width=70, anchor="center")
+        self.tree.column("source", width=140, anchor="center")
+        self.tree.column("status", width=120, anchor="w")
+
+        scrollbar = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scrollbar.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+
+        self.tree.bind("<<TreeviewSelect>>", self._on_select)
+        self.tree.bind("<Double-Button-1>", lambda e: self._toggle_selected())
+
+    def _build_details(self):
+        self.detail_frame = ttk.LabelFrame(self, text="插件详情", padding=8)
+        self.detail_frame.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 10))
+
+        self.lbl_name = ttk.Label(self.detail_frame, text="", font=(theme.FONT, 10, "bold"))
+        self.lbl_name.pack(anchor="w")
+
+        self.lbl_desc = ttk.Label(self.detail_frame, text="请从上方列表选择插件", wraplength=700, style="Dim.TLabel")
+        self.lbl_desc.pack(anchor="w", pady=(4, 2))
+
+        self.lbl_path = ttk.Label(self.detail_frame, text="", style="Dim.TLabel")
+        self.lbl_path.pack(anchor="w")
+
+    def _reload_tree(self):
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        if not self.matcher or not hasattr(self.matcher, "plugin_manager"):
+            return
+
+        source_labels = {
+            "builtin": "内置插件",
+            "dev": "开发目录 (plugins_dev)",
+            "user": "用户目录 (AppData)",
+        }
+        plugins = self.matcher.plugin_manager.get_all_plugins()
+        for p in plugins:
+            status_text = "正常" if not p.error else f"错误: {p.error}"
+            source_text = source_labels.get(p.source, p.source)
+            item_id = self.tree.insert("", "end", values=(
+                "✓" if p.enabled else "×",
+                p.name,
+                p.id,
+                p.version,
+                source_text,
+                status_text,
+            ))
+            self.tree.item(item_id, tags=(p.id,))
+
+    def _on_select(self, event=None):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        item_id = sel[0]
+        plugin_id = self.tree.item(item_id, "tags")[0]
+        if self.matcher and hasattr(self.matcher, "plugin_manager"):
+            p = self.matcher.plugin_manager.plugins.get(plugin_id)
+            if p:
+                self.lbl_name.config(text=f"{p.name} (v{p.version})")
+                desc = p.description or "(暂无描述)"
+                if p.author:
+                    desc += f"  ·  作者: {p.author}"
+                if p.error:
+                    desc += f"\n[加载异常]: {p.error}"
+                self.lbl_desc.config(text=desc)
+                self.lbl_path.config(text=f"目录: {p.path}" if p.path else "内置引擎插件")
+
+    def _toggle_selected(self):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        item_id = sel[0]
+        plugin_id = self.tree.item(item_id, "tags")[0]
+        if self.matcher and hasattr(self.matcher, "plugin_manager"):
+            p = self.matcher.plugin_manager.plugins.get(plugin_id)
+            if p:
+                new_state = not p.enabled
+                self.matcher.plugin_manager.set_plugin_enabled(plugin_id, new_state)
+                self.tree.set(item_id, "enabled", "✓" if new_state else "×")
+                if self.on_plugins_changed:
+                    self.on_plugins_changed()
+
+    def _reload_plugins(self):
+        if self.matcher and hasattr(self.matcher, "plugin_manager"):
+            self.matcher.plugin_manager.reload()
+            self._reload_tree()
+            if self.on_plugins_changed:
+                self.on_plugins_changed()
+
+    def _open_dev_dir(self):
+        if self.matcher and hasattr(self.matcher, "plugin_manager"):
+            path = self.matcher.plugin_manager.dev_plugins_dir
+            os.makedirs(path, exist_ok=True)
+            try:
+                os.startfile(path)
+            except Exception:
+                pass
+
+    def _open_user_dir(self):
+        if self.matcher and hasattr(self.matcher, "plugin_manager"):
+            path = self.matcher.plugin_manager.user_plugins_dir
+            os.makedirs(path, exist_ok=True)
+            try:
+                os.startfile(path)
+            except Exception:
+                pass
